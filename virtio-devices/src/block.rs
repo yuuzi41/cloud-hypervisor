@@ -25,6 +25,7 @@ use block_util::{
 };
 use rate_limiter::{RateLimiter, TokenType};
 use seccompiler::SeccompAction;
+use std::collections::VecDeque;
 use std::io;
 use std::num::Wrapping;
 use std::ops::Deref;
@@ -55,6 +56,9 @@ const COMPLETION_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 2;
 // New 'wake up' event from the rate limiter
 const RATE_LIMITER_EVENT: u16 = EPOLL_HELPER_EVENT_LAST + 3;
 
+// latency scale, for reduce precision loss in calculate.
+const LATENCY_SCALE: u64 = 10000;
+
 #[derive(Error, Debug)]
 pub enum Error {
     #[error("Failed to parse the request: {0}")]
@@ -79,12 +83,37 @@ pub enum Error {
 
 pub type Result<T> = result::Result<T, Error>;
 
-#[derive(Default, Clone)]
+// latency will be records as microseconds, average latency
+// will be save as scaled value.
+#[derive(Clone)]
 pub struct BlockCounters {
     read_bytes: Arc<AtomicU64>,
     read_ops: Arc<AtomicU64>,
+    read_latency_min: Arc<AtomicU64>,
+    read_latency_max: Arc<AtomicU64>,
+    read_latency_avg: Arc<AtomicU64>,
     write_bytes: Arc<AtomicU64>,
     write_ops: Arc<AtomicU64>,
+    write_latency_min: Arc<AtomicU64>,
+    write_latency_max: Arc<AtomicU64>,
+    write_latency_avg: Arc<AtomicU64>,
+}
+
+impl Default for BlockCounters {
+    fn default() -> Self {
+        BlockCounters {
+            read_bytes: Arc::new(AtomicU64::new(0)),
+            read_ops: Arc::new(AtomicU64::new(0)),
+            read_latency_min: Arc::new(AtomicU64::new(u64::MAX)),
+            read_latency_max: Arc::new(AtomicU64::new(0)),
+            read_latency_avg: Arc::new(AtomicU64::new(0)),
+            write_bytes: Arc::new(AtomicU64::new(0)),
+            write_ops: Arc::new(AtomicU64::new(0)),
+            write_latency_min: Arc::new(AtomicU64::new(u64::MAX)),
+            write_latency_max: Arc::new(AtomicU64::new(0)),
+            write_latency_avg: Arc::new(AtomicU64::new(0)),
+        }
+    }
 }
 
 struct BlockEpollHandler {
@@ -100,7 +129,7 @@ struct BlockEpollHandler {
     writeback: Arc<AtomicBool>,
     counters: BlockCounters,
     queue_evt: EventFd,
-    request_list: HashMap<u16, Request>,
+    inflight_requests: VecDeque<(u16, Request)>,
     rate_limiter: Option<RateLimiter>,
     access_platform: Option<Arc<dyn AccessPlatform>>,
     read_only: bool,
@@ -180,7 +209,8 @@ impl BlockEpollHandler {
                 )
                 .map_err(Error::RequestExecuting)?
             {
-                self.request_list.insert(desc_chain.head_index(), request);
+                self.inflight_requests
+                    .push_back((desc_chain.head_index(), request));
             } else {
                 desc_chain
                     .memory()
@@ -199,9 +229,42 @@ impl BlockEpollHandler {
         Ok(used_descs)
     }
 
-    fn process_queue_complete(&mut self) -> Result<bool> {
-        let queue = &mut self.queue;
+    fn process_queue_submit_and_signal(&mut self) -> result::Result<(), EpollHelperError> {
+        let needs_notification = self.process_queue_submit().map_err(|e| {
+            EpollHelperError::HandleEvent(anyhow!("Failed to process queue (submit): {:?}", e))
+        })?;
 
+        if needs_notification {
+            self.signal_used_queue().map_err(|e| {
+                EpollHelperError::HandleEvent(anyhow!("Failed to signal used queue: {:?}", e))
+            })?
+        };
+
+        Ok(())
+    }
+
+    #[inline]
+    fn find_inflight_request(&mut self, completed_head: u16) -> Result<Request> {
+        // This loop neatly handles the fast path where the completions are
+        // in order (it turng into just a pop_front()) and the 1% of the time
+        // (analysis during boot) where slight out of ordering has been
+        // observed e.g.
+        // Submissions: 1 2 3 4 5 6 7
+        // Completions: 2 1 3 5 4 7 6
+        // In this case find the corresponding item and swap it with the front
+        // This is a O(1) operation and is prepared for the future as it it likely
+        // the next completion would be for the one that was skipped which will
+        // now be the new front.
+        for (i, (head, _)) in self.inflight_requests.iter().enumerate() {
+            if head == &completed_head {
+                return Ok(self.inflight_requests.swap_remove_front(i).unwrap().1);
+            }
+        }
+
+        Err(Error::MissingEntryRequestList)
+    }
+
+    fn process_queue_complete(&mut self) -> Result<bool> {
         let mut used_descs = false;
         let mem = self.mem.memory();
         let mut read_bytes = Wrapping(0);
@@ -209,15 +272,18 @@ impl BlockEpollHandler {
         let mut read_ops = Wrapping(0);
         let mut write_ops = Wrapping(0);
 
-        let completion_list = self.disk_image.complete();
-        for (user_data, result) in completion_list {
+        while let Some((user_data, result)) = self.disk_image.next_completed_request() {
             let desc_index = user_data as u16;
-            let mut request = self
-                .request_list
-                .remove(&desc_index)
-                .ok_or(Error::MissingEntryRequestList)?;
+
+            let mut request = self.find_inflight_request(desc_index)?;
+
             request.complete_async().map_err(Error::RequestCompleting)?;
 
+            let latency = request.start.elapsed().as_micros() as u64;
+            let read_ops_last = self.counters.read_ops.load(Ordering::Relaxed) as i64;
+            let write_ops_last = self.counters.write_ops.load(Ordering::Relaxed) as i64;
+            let mut read_avg = self.counters.read_latency_avg.load(Ordering::Relaxed) as i64;
+            let mut write_avg = self.counters.write_latency_avg.load(Ordering::Relaxed) as i64;
             let (status, len) = if result >= 0 {
                 match request.request_type {
                     RequestType::In => {
@@ -225,6 +291,19 @@ impl BlockEpollHandler {
                             read_bytes += Wrapping(*data_len as u64);
                         }
                         read_ops += Wrapping(1);
+                        if latency < self.counters.read_latency_min.load(Ordering::Relaxed) {
+                            self.counters
+                                .read_latency_min
+                                .store(latency, Ordering::Relaxed);
+                        }
+                        if latency > self.counters.read_latency_max.load(Ordering::Relaxed) {
+                            self.counters
+                                .read_latency_max
+                                .store(latency, Ordering::Relaxed);
+                        }
+                        read_avg = read_avg
+                            + ((latency * LATENCY_SCALE) as i64 - read_avg)
+                                / (read_ops_last + read_ops.0 as i64);
                     }
                     RequestType::Out => {
                         if !request.writeback {
@@ -234,9 +313,30 @@ impl BlockEpollHandler {
                             write_bytes += Wrapping(*data_len as u64);
                         }
                         write_ops += Wrapping(1);
+                        if latency < self.counters.write_latency_min.load(Ordering::Relaxed) {
+                            self.counters
+                                .write_latency_min
+                                .store(latency, Ordering::Relaxed);
+                        }
+                        if latency > self.counters.write_latency_max.load(Ordering::Relaxed) {
+                            self.counters
+                                .write_latency_max
+                                .store(latency, Ordering::Relaxed);
+                        }
+                        write_avg = write_avg
+                            + ((latency * LATENCY_SCALE) as i64 - write_avg)
+                                / (write_ops_last + write_ops.0 as i64);
                     }
                     _ => {}
                 }
+
+                self.counters
+                    .read_latency_avg
+                    .store(read_avg as u64, Ordering::Relaxed);
+
+                self.counters
+                    .write_latency_avg
+                    .store(write_avg as u64, Ordering::Relaxed);
 
                 (VIRTIO_BLK_S_OK, result as u32)
             } else {
@@ -250,6 +350,8 @@ impl BlockEpollHandler {
 
             mem.write_obj(status, request.status_addr)
                 .map_err(Error::RequestStatus)?;
+
+            let queue = &mut self.queue;
 
             queue
                 .add_used(mem.deref(), desc_index, len)
@@ -318,21 +420,7 @@ impl EpollHelperHandler for BlockEpollHandler {
 
                 // Process the queue only when the rate limit is not reached
                 if !rate_limit_reached {
-                    let needs_notification = self.process_queue_submit().map_err(|e| {
-                        EpollHelperError::HandleEvent(anyhow!(
-                            "Failed to process queue (submit): {:?}",
-                            e
-                        ))
-                    })?;
-
-                    if needs_notification {
-                        self.signal_used_queue().map_err(|e| {
-                            EpollHelperError::HandleEvent(anyhow!(
-                                "Failed to signal used queue: {:?}",
-                                e
-                            ))
-                        })?
-                    };
+                    self.process_queue_submit_and_signal()?
                 }
             }
             COMPLETION_EVENT => {
@@ -367,21 +455,7 @@ impl EpollHelperHandler for BlockEpollHandler {
                         ))
                     })?;
 
-                    let needs_notification = self.process_queue_submit().map_err(|e| {
-                        EpollHelperError::HandleEvent(anyhow!(
-                            "Failed to process queue (submit): {:?}",
-                            e
-                        ))
-                    })?;
-
-                    if needs_notification {
-                        self.signal_used_queue().map_err(|e| {
-                            EpollHelperError::HandleEvent(anyhow!(
-                                "Failed to signal used queue: {:?}",
-                                e
-                            ))
-                        })?
-                    };
+                    self.process_queue_submit_and_signal()?
                 } else {
                     return Err(EpollHelperError::HandleEvent(anyhow!(
                         "Unexpected 'RATE_LIMITER_EVENT' when rate_limiter is not enabled."
@@ -442,78 +516,80 @@ impl Block {
         exit_evt: EventFd,
         state: Option<BlockState>,
     ) -> io::Result<Self> {
-        let (disk_nsectors, avail_features, acked_features, config) = if let Some(state) = state {
-            info!("Restoring virtio-block {}", id);
-            (
-                state.disk_nsectors,
-                state.avail_features,
-                state.acked_features,
-                state.config,
-            )
-        } else {
-            let disk_size = disk_image.size().map_err(|e| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("Failed getting disk size: {}", e),
+        let (disk_nsectors, avail_features, acked_features, config, paused) =
+            if let Some(state) = state {
+                info!("Restoring virtio-block {}", id);
+                (
+                    state.disk_nsectors,
+                    state.avail_features,
+                    state.acked_features,
+                    state.config,
+                    true,
                 )
-            })?;
-            if disk_size % SECTOR_SIZE != 0 {
-                warn!(
-                    "Disk size {} is not a multiple of sector size {}; \
-                 the remainder will not be visible to the guest.",
-                    disk_size, SECTOR_SIZE
-                );
-            }
-
-            let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
-                | (1u64 << VIRTIO_BLK_F_FLUSH)
-                | (1u64 << VIRTIO_BLK_F_CONFIG_WCE)
-                | (1u64 << VIRTIO_BLK_F_BLK_SIZE)
-                | (1u64 << VIRTIO_BLK_F_TOPOLOGY);
-
-            if iommu {
-                avail_features |= 1u64 << VIRTIO_F_IOMMU_PLATFORM;
-            }
-
-            if read_only {
-                avail_features |= 1u64 << VIRTIO_BLK_F_RO;
-            }
-
-            let topology = disk_image.topology();
-            info!("Disk topology: {:?}", topology);
-
-            let logical_block_size = if topology.logical_block_size > 512 {
-                topology.logical_block_size
             } else {
-                512
+                let disk_size = disk_image.size().map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("Failed getting disk size: {e}"),
+                    )
+                })?;
+                if disk_size % SECTOR_SIZE != 0 {
+                    warn!(
+                        "Disk size {} is not a multiple of sector size {}; \
+                 the remainder will not be visible to the guest.",
+                        disk_size, SECTOR_SIZE
+                    );
+                }
+
+                let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
+                    | (1u64 << VIRTIO_BLK_F_FLUSH)
+                    | (1u64 << VIRTIO_BLK_F_CONFIG_WCE)
+                    | (1u64 << VIRTIO_BLK_F_BLK_SIZE)
+                    | (1u64 << VIRTIO_BLK_F_TOPOLOGY);
+
+                if iommu {
+                    avail_features |= 1u64 << VIRTIO_F_IOMMU_PLATFORM;
+                }
+
+                if read_only {
+                    avail_features |= 1u64 << VIRTIO_BLK_F_RO;
+                }
+
+                let topology = disk_image.topology();
+                info!("Disk topology: {:?}", topology);
+
+                let logical_block_size = if topology.logical_block_size > 512 {
+                    topology.logical_block_size
+                } else {
+                    512
+                };
+
+                // Calculate the exponent that maps physical block to logical block
+                let mut physical_block_exp = 0;
+                let mut size = logical_block_size;
+                while size < topology.physical_block_size {
+                    physical_block_exp += 1;
+                    size <<= 1;
+                }
+
+                let disk_nsectors = disk_size / SECTOR_SIZE;
+                let mut config = VirtioBlockConfig {
+                    capacity: disk_nsectors,
+                    writeback: 1,
+                    blk_size: topology.logical_block_size as u32,
+                    physical_block_exp,
+                    min_io_size: (topology.minimum_io_size / logical_block_size) as u16,
+                    opt_io_size: (topology.optimal_io_size / logical_block_size) as u32,
+                    ..Default::default()
+                };
+
+                if num_queues > 1 {
+                    avail_features |= 1u64 << VIRTIO_BLK_F_MQ;
+                    config.num_queues = num_queues as u16;
+                }
+
+                (disk_nsectors, avail_features, 0, config, false)
             };
-
-            // Calculate the exponent that maps physical block to logical block
-            let mut physical_block_exp = 0;
-            let mut size = logical_block_size;
-            while size < topology.physical_block_size {
-                physical_block_exp += 1;
-                size <<= 1;
-            }
-
-            let disk_nsectors = disk_size / SECTOR_SIZE;
-            let mut config = VirtioBlockConfig {
-                capacity: disk_nsectors,
-                writeback: 1,
-                blk_size: topology.logical_block_size as u32,
-                physical_block_exp,
-                min_io_size: (topology.minimum_io_size / logical_block_size) as u16,
-                opt_io_size: (topology.optimal_io_size / logical_block_size) as u32,
-                ..Default::default()
-            };
-
-            if num_queues > 1 {
-                avail_features |= 1u64 << VIRTIO_BLK_F_MQ;
-                config.num_queues = num_queues as u16;
-            }
-
-            (disk_nsectors, avail_features, 0, config)
-        };
 
         Ok(Block {
             common: VirtioCommon {
@@ -523,6 +599,7 @@ impl Block {
                 paused_sync: Some(Arc::new(Barrier::new(num_queues + 1))),
                 queue_sizes: vec![queue_size; num_queues],
                 min_queues: 1,
+                paused: Arc::new(AtomicBool::new(paused)),
                 ..Default::default()
             },
             id,
@@ -581,6 +658,7 @@ impl Drop for Block {
             // Ignore the result because there is nothing we can do about it.
             let _ = kill_evt.write(1);
         }
+        self.common.wait_for_epoll_threads();
     }
 }
 
@@ -665,7 +743,10 @@ impl VirtioDevice for Block {
                 writeback: self.writeback.clone(),
                 counters: self.counters.clone(),
                 queue_evt,
-                request_list: HashMap::with_capacity(queue_size.into()),
+                // Analysis during boot shows around ~40 maximum requests
+                // This gives head room for systems with slower I/O without
+                // compromising the cost of the reallocation or memory overhead
+                inflight_requests: VecDeque::with_capacity(64),
                 rate_limiter,
                 access_platform: self.common.access_platform.clone(),
                 read_only: self.read_only,
@@ -715,6 +796,30 @@ impl VirtioDevice for Block {
             "write_ops",
             Wrapping(self.counters.write_ops.load(Ordering::Acquire)),
         );
+        counters.insert(
+            "write_latency_min",
+            Wrapping(self.counters.write_latency_min.load(Ordering::Acquire)),
+        );
+        counters.insert(
+            "write_latency_max",
+            Wrapping(self.counters.write_latency_max.load(Ordering::Acquire)),
+        );
+        counters.insert(
+            "write_latency_avg",
+            Wrapping(self.counters.write_latency_avg.load(Ordering::Acquire) / LATENCY_SCALE),
+        );
+        counters.insert(
+            "read_latency_min",
+            Wrapping(self.counters.read_latency_min.load(Ordering::Acquire)),
+        );
+        counters.insert(
+            "read_latency_max",
+            Wrapping(self.counters.read_latency_max.load(Ordering::Acquire)),
+        );
+        counters.insert(
+            "read_latency_avg",
+            Wrapping(self.counters.read_latency_avg.load(Ordering::Acquire) / LATENCY_SCALE),
+        );
 
         Some(counters)
     }
@@ -740,7 +845,7 @@ impl Snapshottable for Block {
     }
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
-        Snapshot::new_from_versioned_state(&self.id(), &self.state())
+        Snapshot::new_from_versioned_state(&self.state())
     }
 }
 impl Transportable for Block {}

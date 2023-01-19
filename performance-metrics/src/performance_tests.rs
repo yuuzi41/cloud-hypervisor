@@ -37,8 +37,7 @@ pub fn init_tests() {
     // The test image can not be created on tmpfs (e.g. /tmp) filesystem,
     // as tmpfs does not support O_DIRECT
     assert!(exec_host_command_output(&format!(
-        "dd if=/dev/zero of={} bs=1M count=4096",
-        BLK_IO_TEST_IMG
+        "dd if=/dev/zero of={BLK_IO_TEST_IMG} bs=1M count=4096"
     ))
     .status
     .success());
@@ -46,7 +45,7 @@ pub fn init_tests() {
 
 pub fn cleanup_tests() {
     fs::remove_file(BLK_IO_TEST_IMG)
-        .unwrap_or_else(|_| panic!("Failed to remove file '{}'.", BLK_IO_TEST_IMG));
+        .unwrap_or_else(|_| panic!("Failed to remove file '{BLK_IO_TEST_IMG}'."));
 }
 
 // Performance tests are expected to be executed sequentially, so we can
@@ -79,7 +78,7 @@ fn direct_kernel_boot_path() -> PathBuf {
 
 pub fn performance_net_throughput(control: &PerformanceTestControl) -> f64 {
     let test_timeout = control.test_timeout;
-    let rx = control.net_rx.unwrap();
+    let (rx, bandwidth) = control.net_control.unwrap();
 
     let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
     let guest = performance_test_new_guest(Box::new(focal));
@@ -92,7 +91,7 @@ pub fn performance_net_throughput(control: &PerformanceTestControl) -> f64 {
     );
 
     let mut child = GuestCommand::new(&guest)
-        .args(["--cpus", &format!("boot={}", num_queues)])
+        .args(["--cpus", &format!("boot={num_queues}")])
         .args(["--memory", "size=4G"])
         .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
         .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
@@ -106,7 +105,7 @@ pub fn performance_net_throughput(control: &PerformanceTestControl) -> f64 {
 
     let r = std::panic::catch_unwind(|| {
         guest.wait_vm_boot(None).unwrap();
-        measure_virtio_net_throughput(test_timeout, num_queues / 2, &guest, rx).unwrap()
+        measure_virtio_net_throughput(test_timeout, num_queues / 2, &guest, rx, bandwidth).unwrap()
     });
 
     let _ = child.kill();
@@ -133,7 +132,7 @@ pub fn performance_net_latency(control: &PerformanceTestControl) -> f64 {
     );
 
     let mut child = GuestCommand::new(&guest)
-        .args(["--cpus", &format!("boot={}", num_queues)])
+        .args(["--cpus", &format!("boot={num_queues}")])
         .args(["--memory", "size=4G"])
         .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
         .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
@@ -336,7 +335,7 @@ pub fn performance_boot_time_pmem(control: &PerformanceTestControl) -> f64 {
 pub fn performance_block_io(control: &PerformanceTestControl) -> f64 {
     let test_timeout = control.test_timeout;
     let num_queues = control.num_queues.unwrap();
-    let fio_ops = control.fio_ops.as_ref().unwrap();
+    let (fio_ops, bandwidth) = control.fio_control.as_ref().unwrap();
 
     let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
     let guest = performance_test_new_guest(Box::new(focal));
@@ -349,7 +348,7 @@ pub fn performance_block_io(control: &PerformanceTestControl) -> f64 {
         .to_string();
 
     let mut child = GuestCommand::new(&guest)
-        .args(["--cpus", &format!("boot={}", num_queues)])
+        .args(["--cpus", &format!("boot={num_queues}")])
         .args(["--memory", "size=4G"])
         .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
         .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
@@ -360,12 +359,14 @@ pub fn performance_block_io(control: &PerformanceTestControl) -> f64 {
                 guest.disk_config.disk(DiskType::OperatingSystem).unwrap()
             )
             .as_str(),
+            "--disk",
             format!(
                 "path={}",
                 guest.disk_config.disk(DiskType::CloudInit).unwrap()
             )
             .as_str(),
-            format!("path={}", BLK_IO_TEST_IMG).as_str(),
+            "--disk",
+            format!("path={BLK_IO_TEST_IMG}").as_str(),
         ])
         .default_net()
         .args(["--api-socket", &api_socket])
@@ -381,8 +382,7 @@ pub fn performance_block_io(control: &PerformanceTestControl) -> f64 {
         let fio_command = format!(
             "sudo fio --filename=/dev/vdc --name=test --output-format=json \
             --direct=1 --bs=4k --ioengine=io_uring --iodepth=64 \
-            --rw={} --runtime={} --numjobs={}",
-            fio_ops, test_timeout, num_queues
+            --rw={fio_ops} --runtime={test_timeout} --numjobs={num_queues}"
         );
         let output = guest
             .ssh_command(&fio_command)
@@ -390,7 +390,11 @@ pub fn performance_block_io(control: &PerformanceTestControl) -> f64 {
             .unwrap();
 
         // Parse fio output
-        parse_fio_output(&output, fio_ops, num_queues).unwrap()
+        if *bandwidth {
+            parse_fio_output(&output, fio_ops, num_queues).unwrap()
+        } else {
+            parse_fio_output_iops(&output, fio_ops, num_queues).unwrap()
+        }
     });
 
     let _ = child.kill();
@@ -427,7 +431,7 @@ mod tests {
 }
        "#;
         assert_eq!(
-            parse_iperf3_output(output.as_bytes(), true).unwrap(),
+            parse_iperf3_output(output.as_bytes(), true, true).unwrap(),
             23957198874.604115
         );
 
@@ -446,8 +450,30 @@ mod tests {
 }
               "#;
         assert_eq!(
-            parse_iperf3_output(output.as_bytes(), false).unwrap(),
+            parse_iperf3_output(output.as_bytes(), false, true).unwrap(),
             39520744482.79
+        );
+        let output = r#"
+{
+    "end":	{
+        "sum":  {
+            "start":        0,
+            "end":  5.000036,
+            "seconds":      5.000036,
+            "bytes":        29944971264,
+            "bits_per_second":      47911877363.396217,
+            "jitter_ms":    0.0038609822983198556,
+            "lost_packets": 16,
+            "packets":      913848,
+            "lost_percent": 0.0017508382137948542,
+            "sender":       true
+        }
+    }
+}
+              "#;
+        assert_eq!(
+            parse_iperf3_output(output.as_bytes(), true, false).unwrap(),
+            182765.08409139456
         );
     }
 

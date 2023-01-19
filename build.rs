@@ -3,13 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-#[macro_use(crate_version)]
-extern crate clap;
-
 use std::process::Command;
 
 fn main() {
-    let mut version = "v".to_owned() + crate_version!();
+    let mut version = "v".to_owned() + env!("CARGO_PKG_VERSION");
 
     if let Ok(git_out) = Command::new("git").args(["describe", "--dirty"]).output() {
         if git_out.status.success() {
@@ -23,5 +20,5 @@ fn main() {
     // variable BUILT_VERSION, so that it can be reused from the binary.
     // Particularly, this is used from src/main.rs to display the exact
     // version.
-    println!("cargo:rustc-env=BUILT_VERSION={}", version);
+    println!("cargo:rustc-env=BUILT_VERSION={version}");
 }

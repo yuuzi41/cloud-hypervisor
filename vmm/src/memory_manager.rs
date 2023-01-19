@@ -5,10 +5,10 @@
 #[cfg(target_arch = "x86_64")]
 use crate::config::SgxEpcConfig;
 use crate::config::{HotplugMethod, MemoryConfig, MemoryZoneConfig};
-#[cfg(feature = "guest_debug")]
-use crate::coredump::{CoredumpMemoryRegion, CoredumpMemoryRegions};
-#[cfg(feature = "guest_debug")]
-use crate::coredump::{DumpState, GuestDebuggableError};
+#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
+use crate::coredump::{
+    CoredumpMemoryRegion, CoredumpMemoryRegions, DumpState, GuestDebuggableError,
+};
 use crate::migration::url_to_path;
 use crate::MEMORY_MANAGER_SNAPSHOT_ID;
 use crate::{GuestMemoryMmap, GuestRegionMmap};
@@ -24,7 +24,7 @@ use hypervisor::HypervisorVmError;
 #[cfg(target_arch = "x86_64")]
 use libc::{MAP_NORESERVE, MAP_POPULATE, MAP_SHARED, PROT_READ, PROT_WRITE};
 use serde::{Deserialize, Serialize};
-#[cfg(feature = "guest_debug")]
+#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::convert::TryInto;
@@ -52,7 +52,7 @@ use vm_memory::{
 };
 use vm_migration::{
     protocol::MemoryRange, protocol::MemoryRangeTable, Migratable, MigratableError, Pausable,
-    Snapshot, SnapshotDataSection, Snapshottable, Transportable, VersionMapped,
+    Snapshot, SnapshotData, Snapshottable, Transportable, VersionMapped,
 };
 
 pub const MEMORY_MANAGER_ACPI_SIZE: usize = 0x18;
@@ -854,7 +854,7 @@ impl MemoryManager {
         let uefi_mem_region = self.vm.make_user_memory_region(
             uefi_mem_slot,
             uefi_region.start_addr().raw_value(),
-            uefi_region.len() as u64,
+            uefi_region.len(),
             uefi_region.as_ptr() as u64,
             false,
             false,
@@ -1160,9 +1160,8 @@ impl MemoryManager {
             let mut memory_file_path = url_to_path(source_url).map_err(Error::Restore)?;
             memory_file_path.push(String::from(SNAPSHOT_FILENAME));
 
-            let mem_snapshot: MemoryManagerSnapshotData = snapshot
-                .to_versioned_state(MEMORY_MANAGER_SNAPSHOT_ID)
-                .map_err(Error::Restore)?;
+            let mem_snapshot: MemoryManagerSnapshotData =
+                snapshot.to_versioned_state().map_err(Error::Restore)?;
 
             let mm = MemoryManager::new(
                 vm,
@@ -1271,6 +1270,10 @@ impl MemoryManager {
         size: usize,
     ) -> Result<FileOffset, Error> {
         if backing_file.is_dir() {
+            warn!(
+                "Using a directory as a backing file for memory is deprecated \
+                and will be removed in a future release. (See #5082)"
+            );
             // Override file offset as it does not apply in this case.
             info!(
                 "Ignoring file offset since the backing file is a \
@@ -1580,6 +1583,20 @@ impl MemoryManager {
         self.vm
             .create_user_memory_region(mem_region)
             .map_err(Error::CreateUserMemoryRegion)?;
+
+        // SAFETY: the address and size are valid since the
+        // mmap succeeded.
+        let ret = unsafe {
+            libc::madvise(
+                userspace_addr as *mut libc::c_void,
+                memory_size as libc::size_t,
+                libc::MADV_DONTDUMP,
+            )
+        };
+        if ret != 0 {
+            let e = io::Error::last_os_error();
+            warn!("Failed to mark mappin as MADV_DONTDUMP: {}", e);
+        }
 
         // Mark the pages as mergeable if explicitly asked for.
         if mergeable {
@@ -1960,7 +1977,7 @@ impl MemoryManager {
         self.uefi_flash.as_ref().unwrap().clone()
     }
 
-    #[cfg(feature = "guest_debug")]
+    #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
     pub fn coredump_memory_regions(&self, mem_offset: u64) -> CoredumpMemoryRegions {
         let mut mapping_sorted_by_gpa = self.guest_ram_mappings.clone();
         mapping_sorted_by_gpa.sort_by_key(|m| m.gpa);
@@ -1981,7 +1998,7 @@ impl MemoryManager {
         CoredumpMemoryRegions { ram_maps }
     }
 
-    #[cfg(feature = "guest_debug")]
+    #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
     pub fn coredump_iterate_save_mem(
         &mut self,
         dump_state: &DumpState,
@@ -2429,8 +2446,6 @@ impl Snapshottable for MemoryManager {
     }
 
     fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
-        let mut memory_manager_snapshot = Snapshot::new(MEMORY_MANAGER_SNAPSHOT_ID);
-
         let memory_ranges = self.memory_range_table(true)?;
 
         // Store locally this list of ranges as it will be used through the
@@ -2443,12 +2458,9 @@ impl Snapshottable for MemoryManager {
         // memory range content for the ranges requiring it.
         self.snapshot_memory_ranges = memory_ranges;
 
-        memory_manager_snapshot.add_data_section(SnapshotDataSection::new_from_versioned_state(
-            MEMORY_MANAGER_SNAPSHOT_ID,
+        Ok(Snapshot::from_data(SnapshotData::new_from_versioned_state(
             &self.snapshot_data(),
-        )?);
-
-        Ok(memory_manager_snapshot)
+        )?))
     }
 }
 

@@ -160,7 +160,7 @@ fn create_cpu_nodes(
     let num_cpus = vcpu_mpidr.len();
 
     for (cpu_id, mpidr) in vcpu_mpidr.iter().enumerate().take(num_cpus) {
-        let cpu_name = format!("cpu@{:x}", cpu_id);
+        let cpu_name = format!("cpu@{cpu_id:x}");
         let cpu_node = fdt.begin_node(&cpu_name)?;
         fdt.property_string("device_type", "cpu")?;
         fdt.property_string("compatible", "arm,arm-v8")?;
@@ -192,15 +192,15 @@ fn create_cpu_nodes(
 
         // Create device tree nodes with regard of above mapping.
         for cluster_idx in 0..packages {
-            let cluster_name = format!("cluster{:x}", cluster_idx);
+            let cluster_name = format!("cluster{cluster_idx:x}");
             let cluster_node = fdt.begin_node(&cluster_name)?;
 
             for core_idx in 0..cores_per_package {
-                let core_name = format!("core{:x}", core_idx);
+                let core_name = format!("core{core_idx:x}");
                 let core_node = fdt.begin_node(&core_name)?;
 
                 for thread_idx in 0..threads_per_core {
-                    let thread_name = format!("thread{:x}", thread_idx);
+                    let thread_name = format!("thread{thread_idx:x}");
                     let thread_node = fdt.begin_node(&thread_name)?;
                     let cpu_idx = threads_per_core * cores_per_package * cluster_idx
                         + threads_per_core * core_idx
@@ -247,7 +247,7 @@ fn create_memory_node(
                     node_memory_addr = memory_region_start_addr;
                 }
             }
-            let memory_node_name = format!("memory@{:x}", node_memory_addr);
+            let memory_node_name = format!("memory@{node_memory_addr:x}");
             let memory_node = fdt.begin_node(&memory_node_name)?;
             fdt.property_string("device_type", "memory")?;
             fdt.property_array_u64("reg", &mem_reg_prop)?;
@@ -259,7 +259,7 @@ fn create_memory_node(
         if last_addr < super::layout::MEM_32BIT_RESERVED_START.raw_value() {
             // Case 1: all RAM is under the hole
             let mem_size = last_addr - super::layout::RAM_START.raw_value() + 1;
-            let mem_reg_prop = [super::layout::RAM_START.raw_value() as u64, mem_size as u64];
+            let mem_reg_prop = [super::layout::RAM_START.raw_value(), mem_size];
             let memory_node = fdt.begin_node("memory")?;
             fdt.property_string("device_type", "memory")?;
             fdt.property_array_u64("reg", &mem_reg_prop)?;
@@ -269,7 +269,7 @@ fn create_memory_node(
             // Region 1: RAM before the hole
             let mem_size = super::layout::MEM_32BIT_RESERVED_START.raw_value()
                 - super::layout::RAM_START.raw_value();
-            let mem_reg_prop = [super::layout::RAM_START.raw_value() as u64, mem_size as u64];
+            let mem_reg_prop = [super::layout::RAM_START.raw_value(), mem_size];
             let memory_node_name = format!("memory@{:x}", super::layout::RAM_START.raw_value());
             let memory_node = fdt.begin_node(&memory_node_name)?;
             fdt.property_string("device_type", "memory")?;
@@ -278,10 +278,7 @@ fn create_memory_node(
 
             // Region 2: RAM after the hole
             let mem_size = last_addr - super::layout::RAM_64BIT_START.raw_value() + 1;
-            let mem_reg_prop = [
-                super::layout::RAM_64BIT_START.raw_value() as u64,
-                mem_size as u64,
-            ];
+            let mem_reg_prop = [super::layout::RAM_64BIT_START.raw_value(), mem_size];
             let memory_node_name =
                 format!("memory@{:x}", super::layout::RAM_64BIT_START.raw_value());
             let memory_node = fdt.begin_node(&memory_node_name)?;
@@ -303,7 +300,7 @@ fn create_chosen_node(
     fdt.property_string("bootargs", cmdline)?;
 
     if let Some(initrd_config) = initrd {
-        let initrd_start = initrd_config.address.raw_value() as u64;
+        let initrd_start = initrd_config.address.raw_value();
         let initrd_end = initrd_config.address.raw_value() + initrd_config.size as u64;
         fdt.property_u64("linux,initrd-start", initrd_start)?;
         fdt.property_u64("linux,initrd-end", initrd_end)?;
@@ -670,7 +667,7 @@ fn create_pci_nodes(
 
                 // See kernel document Documentation/devicetree/bindings/virtio/iommu.txt
                 // for virtio-iommu node settings.
-                let virtio_iommu_node_name = format!("virtio_iommu@{:x}", virtio_iommu_bdf);
+                let virtio_iommu_node_name = format!("virtio_iommu@{virtio_iommu_bdf:x}");
                 let virtio_iommu_node = fdt.begin_node(&virtio_iommu_node_name)?;
                 fdt.property_u32("#iommu-cells", 1)?;
                 fdt.property_string("compatible", "virtio,pci-iommu")?;

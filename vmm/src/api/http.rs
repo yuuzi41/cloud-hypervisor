@@ -52,7 +52,7 @@ const HTTP_ROOT: &str = "/api/v1";
 
 pub fn error_response(error: HttpError, status: StatusCode) -> Response {
     let mut response = Response::new(Version::Http11, status);
-    response.set_body(Body::new(format!("{:?}", error)));
+    response.set_body(Body::new(format!("{error:?}")));
 
     response
 }
@@ -238,7 +238,7 @@ pub static HTTP_ROUTES: Lazy<HttpRoutes> = Lazy::new(|| {
         endpoint!("/vm.snapshot"),
         Box::new(VmActionHandler::new(VmAction::Snapshot(Arc::default()))),
     );
-    #[cfg(feature = "guest_debug")]
+    #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
     r.routes.insert(
         endpoint!("/vm.coredump"),
         Box::new(VmActionHandler::new(VmAction::Coredump(Arc::default()))),
@@ -342,8 +342,9 @@ pub fn start_http_path_thread(
 ) -> Result<thread::JoinHandle<Result<()>>> {
     let socket_path = PathBuf::from(path);
     let socket_fd = UnixListener::bind(socket_path).map_err(VmmError::CreateApiServerSocket)?;
-    let server =
-        HttpServer::new_from_fd(socket_fd.into_raw_fd()).map_err(VmmError::CreateApiServer)?;
+    // SAFETY: Valid FD just opened
+    let server = unsafe { HttpServer::new_from_fd(socket_fd.into_raw_fd()) }
+        .map_err(VmmError::CreateApiServer)?;
     start_http_thread(
         server,
         api_notifier,
@@ -362,7 +363,8 @@ pub fn start_http_fd_thread(
     exit_evt: EventFd,
     hypervisor_type: HypervisorType,
 ) -> Result<thread::JoinHandle<Result<()>>> {
-    let server = HttpServer::new_from_fd(fd).map_err(VmmError::CreateApiServer)?;
+    // SAFETY: Valid FD
+    let server = unsafe { HttpServer::new_from_fd(fd) }.map_err(VmmError::CreateApiServer)?;
     start_http_thread(
         server,
         api_notifier,

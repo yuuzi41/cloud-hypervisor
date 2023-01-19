@@ -547,13 +547,30 @@ impl CpuidFeatureEntry {
 }
 
 pub fn generate_common_cpuid(
-    hypervisor: Arc<dyn hypervisor::Hypervisor>,
+    hypervisor: &Arc<dyn hypervisor::Hypervisor>,
     topology: Option<(u8, u8, u8)>,
     sgx_epc_sections: Option<Vec<SgxEpcSection>>,
     phys_bits: u8,
     kvm_hyperv: bool,
     #[cfg(feature = "tdx")] tdx_enabled: bool,
 ) -> super::Result<Vec<CpuIdEntry>> {
+    // SAFETY: cpuid called with valid leaves
+    if unsafe { x86_64::__cpuid(1) }.ecx & 1 << HYPERVISOR_ECX_BIT == 1 << HYPERVISOR_ECX_BIT {
+        // SAFETY: cpuid called with valid leaves
+        let hypervisor_cpuid = unsafe { x86_64::__cpuid(0x4000_0000) };
+
+        let mut identifier: [u8; 12] = [0; 12];
+        identifier[0..4].copy_from_slice(&hypervisor_cpuid.ebx.to_le_bytes()[..]);
+        identifier[4..8].copy_from_slice(&hypervisor_cpuid.ecx.to_le_bytes()[..]);
+        identifier[8..12].copy_from_slice(&hypervisor_cpuid.edx.to_le_bytes()[..]);
+
+        info!(
+            "Running under nested virtualisation. Hypervisor string: {}",
+            String::from_utf8_lossy(&identifier)
+        );
+    }
+
+    info!("Generating guest CPUID for with physical address size: {phys_bits}");
     let cpuid_patches = vec![
         // Patch tsc deadline timer bit
         CpuidPatch {
@@ -742,8 +759,7 @@ pub fn generate_common_cpuid(
 pub fn configure_vcpu(
     vcpu: &Arc<dyn hypervisor::Vcpu>,
     id: u8,
-    kernel_entry_point: Option<EntryPoint>,
-    vm_memory: &GuestMemoryAtomic<GuestMemoryMmap>,
+    boot_setup: Option<(EntryPoint, &GuestMemoryAtomic<GuestMemoryMmap>)>,
     cpuid: Vec<CpuIdEntry>,
     kvm_hyperv: bool,
 ) -> super::Result<()> {
@@ -760,12 +776,12 @@ pub fn configure_vcpu(
     }
 
     regs::setup_msrs(vcpu).map_err(Error::MsrsConfiguration)?;
-    if let Some(kernel_entry_point) = kernel_entry_point {
+    if let Some((kernel_entry_point, guest_memory)) = boot_setup {
         if let Some(entry_addr) = kernel_entry_point.entry_addr {
             // Safe to unwrap because this method is called after the VM is configured
             regs::setup_regs(vcpu, entry_addr.raw_value()).map_err(Error::RegsConfiguration)?;
             regs::setup_fpu(vcpu).map_err(Error::FpuConfiguration)?;
-            regs::setup_sregs(&vm_memory.memory(), vcpu).map_err(Error::SregsConfiguration)?;
+            regs::setup_sregs(&guest_memory.memory(), vcpu).map_err(Error::SregsConfiguration)?;
         }
     }
     interrupts::set_lint(vcpu).map_err(|e| Error::LocalIntConfiguration(e.into()))?;
@@ -1321,6 +1337,6 @@ mod tests {
         add_memmap_entry(&mut memmap, 0, 0x1000, E820_RAM);
         add_memmap_entry(&mut memmap, 0x10000, 0xa000, E820_RESERVED);
 
-        assert_eq!(format!("{:?}", memmap), format!("{:?}", expected_memmap));
+        assert_eq!(format!("{memmap:?}"), format!("{expected_memmap:?}"));
     }
 }

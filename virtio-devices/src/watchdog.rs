@@ -216,7 +216,7 @@ impl Watchdog {
         state: Option<WatchdogState>,
     ) -> io::Result<Watchdog> {
         let mut last_ping_time = None;
-        let (avail_features, acked_features) = if let Some(state) = state {
+        let (avail_features, acked_features, paused) = if let Some(state) = state {
             info!("Restoring virtio-watchdog {}", id);
 
             // When restoring enable the watchdog if it was previously enabled.
@@ -226,9 +226,9 @@ impl Watchdog {
                 last_ping_time = Some(Instant::now());
             }
 
-            (state.avail_features, state.acked_features)
+            (state.avail_features, state.acked_features, true)
         } else {
-            (1u64 << VIRTIO_F_VERSION_1, 0)
+            (1u64 << VIRTIO_F_VERSION_1, 0, false)
         };
 
         let timer_fd = timerfd_create().map_err(|e| {
@@ -246,6 +246,7 @@ impl Watchdog {
                 avail_features,
                 acked_features,
                 min_queues: 1,
+                paused: Arc::new(AtomicBool::new(paused)),
                 ..Default::default()
             },
             id,
@@ -277,6 +278,7 @@ impl Drop for Watchdog {
             // Ignore the result because there is nothing we can do about it.
             let _ = kill_evt.write(1);
         }
+        self.common.wait_for_epoll_threads();
     }
 }
 
@@ -418,7 +420,7 @@ impl Snapshottable for Watchdog {
     }
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
-        Snapshot::new_from_versioned_state(&self.id, &self.state())
+        Snapshot::new_from_versioned_state(&self.state())
     }
 }
 

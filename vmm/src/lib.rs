@@ -3,8 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-#![allow(clippy::significant_drop_in_scrutinee)]
-
 #[macro_use]
 extern crate event_monitor;
 #[macro_use]
@@ -18,7 +16,7 @@ use crate::config::{
     add_to_config, DeviceConfig, DiskConfig, FsConfig, NetConfig, PmemConfig, RestoreConfig,
     UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
 };
-#[cfg(feature = "guest_debug")]
+#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::GuestDebuggable;
 use crate::memory_manager::MemoryManager;
 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
@@ -61,7 +59,7 @@ mod acpi;
 pub mod api;
 mod clone3;
 pub mod config;
-#[cfg(feature = "guest_debug")]
+#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 mod coredump;
 pub mod cpu;
 pub mod device_manager;
@@ -228,6 +226,26 @@ impl EpollContext {
             epoll::ControlOptions::EPOLL_CTL_ADD,
             fd.as_raw_fd(),
             epoll::Event::new(epoll::Events::EPOLLIN, dispatch_index),
+        )?;
+
+        Ok(())
+    }
+
+    #[cfg(fuzzing)]
+    pub fn add_event_custom<T>(
+        &mut self,
+        fd: &T,
+        id: u64,
+        evts: epoll::Events,
+    ) -> result::Result<(), io::Error>
+    where
+        T: AsRawFd,
+    {
+        epoll::ctl(
+            self.epoll_file.as_raw_fd(),
+            epoll::ControlOptions::EPOLL_CTL_ADD,
+            fd.as_raw_fd(),
+            epoll::Event::new(evts, id),
         )?;
 
         Ok(())
@@ -564,6 +582,9 @@ impl Vmm {
                         None,
                         None,
                         None,
+                        None,
+                        None,
+                        None,
                     )?;
 
                     self.vm = Some(vm);
@@ -647,30 +668,33 @@ impl Vmm {
             .try_clone()
             .map_err(VmError::EventFdClone)?;
 
-        let vm = Vm::new_from_snapshot(
-            &snapshot,
+        let vm = Vm::new(
             vm_config,
             exit_evt,
             reset_evt,
             #[cfg(feature = "guest_debug")]
             debug_evt,
-            Some(source_url),
-            restore_cfg.prefault,
             &self.seccomp_action,
             self.hypervisor.clone(),
             activate_evt,
+            None,
+            None,
+            None,
+            Some(snapshot),
+            Some(source_url),
+            Some(restore_cfg.prefault),
         )?;
         self.vm = Some(vm);
 
         // Now we can restore the rest of the VM.
         if let Some(ref mut vm) = self.vm {
-            vm.restore(snapshot).map_err(VmError::Restore)
+            vm.restore()
         } else {
             Err(VmError::VmNotCreated)
         }
     }
 
-    #[cfg(feature = "guest_debug")]
+    #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
     fn vm_coredump(&mut self, destination_url: &str) -> result::Result<(), VmError> {
         if let Some(ref mut vm) = self.vm {
             vm.coredump(destination_url).map_err(VmError::Coredump)
@@ -736,6 +760,9 @@ impl Vmm {
             serial_pty,
             console_pty,
             console_resize_pipe,
+            None,
+            None,
+            None,
         )?;
 
         // And we boot it
@@ -1231,18 +1258,20 @@ impl Vmm {
             &self.seccomp_action,
             self.hypervisor.clone(),
             activate_evt,
-            true,
             timestamp,
-            Some(&snapshot),
+            None,
+            None,
+            None,
+            Some(snapshot),
         )
         .map_err(|e| {
             MigratableError::MigrateReceive(anyhow!("Error creating VM from snapshot: {:?}", e))
         })?;
 
         // Create VM
-        vm.restore(snapshot).map_err(|e| {
+        vm.restore().map_err(|e| {
             Response::error().write_to(socket).ok();
-            e
+            MigratableError::MigrateReceive(anyhow!("Failed restoring the Vm: {}", e))
         })?;
         self.vm = Some(vm);
 
@@ -1474,7 +1503,7 @@ impl Vmm {
         let common_cpuid = {
             let phys_bits = vm::physical_bits(vm_config.lock().unwrap().cpus.max_phys_bits);
             arch::generate_common_cpuid(
-                hypervisor,
+                &hypervisor,
                 None,
                 None,
                 phys_bits,
@@ -1664,7 +1693,7 @@ impl Vmm {
 
             let phys_bits = vm::physical_bits(vm_config.cpus.max_phys_bits);
             arch::generate_common_cpuid(
-                self.hypervisor.clone(),
+                &self.hypervisor.clone(),
                 None,
                 None,
                 phys_bits,
@@ -1837,7 +1866,7 @@ impl Vmm {
 
                                     sender.send(response).map_err(Error::ApiResponseSend)?;
                                 }
-                                #[cfg(feature = "guest_debug")]
+                                #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
                                 ApiRequest::VmCoredump(coredump_data, sender) => {
                                     let response = self
                                         .vm_coredump(&coredump_data.destination_url)

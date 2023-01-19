@@ -3,13 +3,11 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-#[macro_use(crate_version)]
-extern crate clap;
-
 use std::process::Command;
 
 fn main() {
-    let mut git_human_readable = "v".to_owned() + crate_version!();
+    let mut git_human_readable = "v".to_owned() + env!("CARGO_PKG_VERSION");
+
     if let Ok(git_out) = Command::new("git").args(["describe", "--dirty"]).output() {
         if git_out.status.success() {
             if let Ok(git_out_str) = String::from_utf8(git_out.stdout) {
@@ -22,5 +20,5 @@ fn main() {
     // variable GIT_HUMAN_READABLE, so that it can be reused from the binary.
     // Particularly, this is used from the main.rs to display the exact
     // version information.
-    println!("cargo:rustc-env=GIT_HUMAN_READABLE={}", git_human_readable);
+    println!("cargo:rustc-env=GIT_HUMAN_READABLE={git_human_readable}");
 }

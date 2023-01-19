@@ -8,8 +8,6 @@
 //
 // SPDX-License-Identifier: (Apache-2.0 AND BSD-3-Clause)
 
-#![allow(clippy::significant_drop_in_scrutinee)]
-
 use block_util::{build_disk_image_id, Request, VirtioBlockConfig};
 use libc::EFD_NONBLOCK;
 use log::*;
@@ -72,14 +70,9 @@ enum Error {
     SocketParameterMissing,
 }
 
-pub const SYNTAX: &str = "vhost-user-block backend parameters \
- \"path=<image_path>,socket=<socket_path>,num_queues=<number_of_queues>,\
- queue_size=<size_of_each_queue>,readonly=true|false,direct=true|false,\
- poll_queue=true|false\"";
-
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "vhost_user_block_error: {:?}", self)
+        write!(f, "vhost_user_block_error: {self:?}")
     }
 }
 
@@ -504,7 +497,7 @@ pub fn start_block_backend(backend_command: &str) {
     let backend_config = match VhostUserBlkBackendConfig::parse(backend_command) {
         Ok(config) => config,
         Err(e) => {
-            println!("Failed parsing parameters {:?}", e);
+            println!("Failed parsing parameters {e:?}");
             process::exit(1);
         }
     };

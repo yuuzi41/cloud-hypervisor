@@ -435,7 +435,7 @@ impl VersionMapped for NetState {}
 impl Net {
     /// Create a new virtio network device with the given TAP interface.
     #[allow(clippy::too_many_arguments)]
-    fn new_with_tap(
+    pub fn new_with_tap(
         id: String,
         taps: Vec<Tap>,
         guest_mac: Option<MacAddr>,
@@ -446,62 +446,81 @@ impl Net {
         rate_limiter_config: Option<RateLimiterConfig>,
         exit_evt: EventFd,
         state: Option<NetState>,
+        offload_tso: bool,
+        offload_ufo: bool,
+        offload_csum: bool,
     ) -> Result<Self> {
         assert!(!taps.is_empty());
 
         let mtu = taps[0].mtu().map_err(Error::TapError)? as u16;
 
-        let (avail_features, acked_features, config, queue_sizes) = if let Some(state) = state {
-            info!("Restoring virtio-net {}", id);
-            (
-                state.avail_features,
-                state.acked_features,
-                state.config,
-                state.queue_size,
-            )
-        } else {
-            let mut avail_features = 1 << VIRTIO_NET_F_CSUM
-                | 1 << VIRTIO_NET_F_CTRL_GUEST_OFFLOADS
-                | 1 << VIRTIO_NET_F_GUEST_CSUM
-                | 1 << VIRTIO_NET_F_GUEST_ECN
-                | 1 << VIRTIO_NET_F_GUEST_TSO4
-                | 1 << VIRTIO_NET_F_GUEST_TSO6
-                | 1 << VIRTIO_NET_F_GUEST_UFO
-                | 1 << VIRTIO_NET_F_HOST_ECN
-                | 1 << VIRTIO_NET_F_HOST_TSO4
-                | 1 << VIRTIO_NET_F_HOST_TSO6
-                | 1 << VIRTIO_NET_F_HOST_UFO
-                | 1 << VIRTIO_NET_F_MTU
-                | 1 << VIRTIO_RING_F_EVENT_IDX
-                | 1 << VIRTIO_F_VERSION_1;
-
-            if iommu {
-                avail_features |= 1u64 << VIRTIO_F_IOMMU_PLATFORM;
-            }
-
-            avail_features |= 1 << VIRTIO_NET_F_CTRL_VQ;
-            let queue_num = num_queues + 1;
-
-            let mut config = VirtioNetConfig::default();
-            if let Some(mac) = guest_mac {
-                build_net_config_space(
-                    &mut config,
-                    mac,
-                    num_queues,
-                    Some(mtu),
-                    &mut avail_features,
-                );
+        let (avail_features, acked_features, config, queue_sizes, paused) =
+            if let Some(state) = state {
+                info!("Restoring virtio-net {}", id);
+                (
+                    state.avail_features,
+                    state.acked_features,
+                    state.config,
+                    state.queue_size,
+                    true,
+                )
             } else {
-                build_net_config_space_with_mq(
-                    &mut config,
-                    num_queues,
-                    Some(mtu),
-                    &mut avail_features,
-                );
-            }
+                let mut avail_features =
+                    1 << VIRTIO_NET_F_MTU | 1 << VIRTIO_RING_F_EVENT_IDX | 1 << VIRTIO_F_VERSION_1;
 
-            (avail_features, 0, config, vec![queue_size; queue_num])
-        };
+                if iommu {
+                    avail_features |= 1u64 << VIRTIO_F_IOMMU_PLATFORM;
+                }
+
+                // Configure TSO/UFO features when hardware checksum offload is enabled.
+                if offload_csum {
+                    avail_features |= 1 << VIRTIO_NET_F_CSUM
+                        | 1 << VIRTIO_NET_F_GUEST_CSUM
+                        | 1 << VIRTIO_NET_F_CTRL_GUEST_OFFLOADS;
+
+                    if offload_tso {
+                        avail_features |= 1 << VIRTIO_NET_F_HOST_ECN
+                            | 1 << VIRTIO_NET_F_HOST_TSO4
+                            | 1 << VIRTIO_NET_F_HOST_TSO6
+                            | 1 << VIRTIO_NET_F_GUEST_ECN
+                            | 1 << VIRTIO_NET_F_GUEST_TSO4
+                            | 1 << VIRTIO_NET_F_GUEST_TSO6;
+                    }
+
+                    if offload_ufo {
+                        avail_features |= 1 << VIRTIO_NET_F_HOST_UFO | 1 << VIRTIO_NET_F_GUEST_UFO;
+                    }
+                }
+
+                avail_features |= 1 << VIRTIO_NET_F_CTRL_VQ;
+                let queue_num = num_queues + 1;
+
+                let mut config = VirtioNetConfig::default();
+                if let Some(mac) = guest_mac {
+                    build_net_config_space(
+                        &mut config,
+                        mac,
+                        num_queues,
+                        Some(mtu),
+                        &mut avail_features,
+                    );
+                } else {
+                    build_net_config_space_with_mq(
+                        &mut config,
+                        num_queues,
+                        Some(mtu),
+                        &mut avail_features,
+                    );
+                }
+
+                (
+                    avail_features,
+                    0,
+                    config,
+                    vec![queue_size; queue_num],
+                    false,
+                )
+            };
 
         Ok(Net {
             common: VirtioCommon {
@@ -511,6 +530,7 @@ impl Net {
                 queue_sizes,
                 paused_sync: Some(Arc::new(Barrier::new((num_queues / 2) + 1))),
                 min_queues: 2,
+                paused: Arc::new(AtomicBool::new(paused)),
                 ..Default::default()
             },
             id,
@@ -542,6 +562,9 @@ impl Net {
         rate_limiter_config: Option<RateLimiterConfig>,
         exit_evt: EventFd,
         state: Option<NetState>,
+        offload_tso: bool,
+        offload_ufo: bool,
+        offload_csum: bool,
     ) -> Result<Self> {
         let taps = open_tap(
             if_name,
@@ -565,6 +588,9 @@ impl Net {
             rate_limiter_config,
             exit_evt,
             state,
+            offload_tso,
+            offload_ufo,
+            offload_csum,
         )
     }
 
@@ -580,6 +606,9 @@ impl Net {
         rate_limiter_config: Option<RateLimiterConfig>,
         exit_evt: EventFd,
         state: Option<NetState>,
+        offload_tso: bool,
+        offload_ufo: bool,
+        offload_csum: bool,
     ) -> Result<Self> {
         let mut taps: Vec<Tap> = Vec::new();
         let num_queue_pairs = fds.len();
@@ -612,6 +641,9 @@ impl Net {
             rate_limiter_config,
             exit_evt,
             state,
+            offload_tso,
+            offload_ufo,
+            offload_csum,
         )
     }
 
@@ -623,6 +655,11 @@ impl Net {
             queue_size: self.common.queue_sizes.clone(),
         }
     }
+
+    #[cfg(fuzzing)]
+    pub fn wait_for_epoll_threads(&mut self) {
+        self.common.wait_for_epoll_threads();
+    }
 }
 
 impl Drop for Net {
@@ -633,6 +670,11 @@ impl Drop for Net {
         }
         // Needed to ensure all references to tap FDs are dropped (#4868)
         self.common.wait_for_epoll_threads();
+        if let Some(thread) = self.ctrl_queue_epoll_thread.take() {
+            if let Err(e) = thread.join() {
+                error!("Error joining thread: {:?}", e);
+            }
+        }
     }
 }
 
@@ -735,6 +777,7 @@ impl VirtioDevice for Net {
                 .map_err(ActivateError::CreateRateLimiter)?;
 
             let tap = taps.remove(0);
+            #[cfg(not(fuzzing))]
             tap.set_offload(virtio_features_to_tap_offload(self.common.acked_features))
                 .map_err(|e| {
                     error!("Error programming tap offload: {:?}", e);
@@ -842,7 +885,7 @@ impl Snapshottable for Net {
     }
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
-        Snapshot::new_from_versioned_state(&self.id, &self.state())
+        Snapshot::new_from_versioned_state(&self.state())
     }
 }
 impl Transportable for Net {}

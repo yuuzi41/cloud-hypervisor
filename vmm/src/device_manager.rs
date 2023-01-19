@@ -62,7 +62,6 @@ use pci::{
 use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap};
-use std::convert::TryInto;
 use std::fs::{read_link, File, OpenOptions};
 use std::io::{self, stdout, Seek, SeekFrom};
 use std::mem::zeroed;
@@ -96,7 +95,7 @@ use vm_memory::{Address, GuestAddress, GuestUsize, MmapRegion};
 use vm_memory::{GuestAddressSpace, GuestMemory};
 use vm_migration::{
     protocol::MemoryRangeTable, snapshot_from_id, versioned_state_from_id, Migratable,
-    MigratableError, Pausable, Snapshot, SnapshotDataSection, Snapshottable, Transportable,
+    MigratableError, Pausable, Snapshot, SnapshotData, Snapshottable, Transportable,
 };
 use vm_virtio::AccessPlatform;
 use vm_virtio::VirtioDeviceType;
@@ -504,19 +503,13 @@ pub fn create_pty() -> io::Result<(File, File, PathBuf)> {
     };
     let mut unlock: libc::c_ulong = 0;
     // SAFETY: FFI call into libc, trivially safe
-    unsafe {
-        libc::ioctl(
-            main.as_raw_fd(),
-            TIOCSPTLCK.try_into().unwrap(),
-            &mut unlock,
-        )
-    };
+    unsafe { libc::ioctl(main.as_raw_fd(), TIOCSPTLCK as _, &mut unlock) };
 
     // SAFETY: FFI call into libc, trivally safe
     let sub_fd = unsafe {
         libc::ioctl(
             main.as_raw_fd(),
-            TIOCGTPEER.try_into().unwrap(),
+            TIOCGTPEER as _,
             libc::O_NOCTTY | libc::O_RDWR,
         )
     };
@@ -524,7 +517,7 @@ pub fn create_pty() -> io::Result<(File, File, PathBuf)> {
         return vmm_sys_util::errno::errno_result().map_err(|e| e.into());
     }
 
-    let proc_path = PathBuf::from(format!("/proc/self/fd/{}", sub_fd));
+    let proc_path = PathBuf::from(format!("/proc/self/fd/{sub_fd}"));
     let path = read_link(proc_path)?;
 
     // SAFETY: sub_fd is checked to be valid before being wrapped in File
@@ -672,15 +665,14 @@ impl DeviceRelocation for AddressManager {
                     return Err(io::Error::new(
                         io::ErrorKind::Other,
                         format!(
-                            "Couldn't find a resource with base 0x{:x} for device {}",
-                            old_base, id
+                            "Couldn't find a resource with base 0x{old_base:x} for device {id}"
                         ),
                     ));
                 }
             } else {
                 return Err(io::Error::new(
                     io::ErrorKind::Other,
-                    format!("Couldn't find device {} from device tree", id),
+                    format!("Couldn't find device {id} from device tree"),
                 ));
             }
         }
@@ -694,7 +686,7 @@ impl DeviceRelocation for AddressManager {
                     self.vm.unregister_ioevent(event, &io_addr).map_err(|e| {
                         io::Error::new(
                             io::ErrorKind::Other,
-                            format!("failed to unregister ioevent: {:?}", e),
+                            format!("failed to unregister ioevent: {e:?}"),
                         )
                     })?;
                 }
@@ -705,7 +697,7 @@ impl DeviceRelocation for AddressManager {
                         .map_err(|e| {
                             io::Error::new(
                                 io::ErrorKind::Other,
-                                format!("failed to register ioevent: {:?}", e),
+                                format!("failed to register ioevent: {e:?}"),
                             )
                         })?;
                 }
@@ -726,7 +718,7 @@ impl DeviceRelocation for AddressManager {
                         self.vm.remove_user_memory_region(mem_region).map_err(|e| {
                             io::Error::new(
                                 io::ErrorKind::Other,
-                                format!("failed to remove user memory region: {:?}", e),
+                                format!("failed to remove user memory region: {e:?}"),
                             )
                         })?;
 
@@ -743,7 +735,7 @@ impl DeviceRelocation for AddressManager {
                         self.vm.create_user_memory_region(mem_region).map_err(|e| {
                             io::Error::new(
                                 io::ErrorKind::Other,
-                                format!("failed to create user memory regions: {:?}", e),
+                                format!("failed to create user memory regions: {e:?}"),
                             )
                         })?;
 
@@ -752,7 +744,7 @@ impl DeviceRelocation for AddressManager {
                         virtio_dev.set_shm_regions(shm_regions).map_err(|e| {
                             io::Error::new(
                                 io::ErrorKind::Other,
-                                format!("failed to update shared memory regions: {:?}", e),
+                                format!("failed to update shared memory regions: {e:?}"),
                             )
                         })?;
                     }
@@ -931,9 +923,6 @@ pub struct DeviceManager {
     // Flag to force setting the iommu on virtio devices
     force_iommu: bool,
 
-    // Helps identify if the VM is currently being restored
-    restoring: bool,
-
     // io_uring availability if detected
     io_uring_supported: Option<bool>,
 
@@ -968,7 +957,6 @@ impl DeviceManager {
         numa_nodes: NumaNodes,
         activate_evt: &EventFd,
         force_iommu: bool,
-        restoring: bool,
         boot_id_list: BTreeSet<String>,
         timestamp: Instant,
         snapshot: Option<Snapshot>,
@@ -976,7 +964,15 @@ impl DeviceManager {
     ) -> DeviceManagerResult<Arc<Mutex<Self>>> {
         trace_scoped!("DeviceManager::new");
 
-        let device_tree = Arc::new(Mutex::new(DeviceTree::new()));
+        let (device_tree, device_id_cnt) = if let Some(snapshot) = snapshot.as_ref() {
+            let state: DeviceManagerState = snapshot.to_state().unwrap();
+            (
+                Arc::new(Mutex::new(state.device_tree.clone())),
+                state.device_id_cnt,
+            )
+        } else {
+            (Arc::new(Mutex::new(DeviceTree::new())), Wrapping(0))
+        };
 
         let num_pci_segments =
             if let Some(platform_config) = config.lock().unwrap().platform.as_ref() {
@@ -1085,7 +1081,7 @@ impl DeviceManager {
             cpu_manager,
             virtio_devices: Vec::new(),
             bus_devices: Vec::new(),
-            device_id_cnt: Wrapping(0),
+            device_id_cnt,
             msi_interrupt_manager,
             legacy_interrupt_manager: None,
             passthrough_device: None,
@@ -1115,7 +1111,6 @@ impl DeviceManager {
             #[cfg(target_arch = "aarch64")]
             gpio_device: None,
             force_iommu,
-            restoring,
             io_uring_supported: None,
             boot_id_list,
             timestamp,
@@ -1243,11 +1238,6 @@ impl DeviceManager {
             device_tree: self.device_tree.lock().unwrap().clone(),
             device_id_cnt: self.device_id_cnt,
         }
-    }
-
-    fn set_state(&mut self, state: &DeviceManagerState) {
-        *self.device_tree.lock().unwrap() = state.device_tree.clone();
-        self.device_id_cnt = state.device_id_cnt;
     }
 
     fn get_msi_iova_space(&mut self) -> (u64, u64) {
@@ -1383,10 +1373,35 @@ impl DeviceManager {
 
         self.interrupt_controller = Some(interrupt_controller.clone());
 
-        // Unlike x86_64, the "interrupt_controller" here for AArch64 is only
-        // a `Gic` object that implements the `InterruptController` to provide
-        // interrupt delivery service. This is not the real GIC device so that
-        // we do not need to insert it to the device tree.
+        // Restore the vGic if this is in the process of restoration
+        let id = String::from(gic::GIC_SNAPSHOT_ID);
+        if let Some(vgic_snapshot) = snapshot_from_id(self.snapshot.as_ref(), &id) {
+            // PMU support is optional. Nothing should be impacted if the PMU initialization failed.
+            if self
+                .cpu_manager
+                .lock()
+                .unwrap()
+                .init_pmu(arch::aarch64::fdt::AARCH64_PMU_IRQ + 16)
+                .is_err()
+            {
+                info!("Failed to initialize PMU");
+            }
+
+            let vgic_state = vgic_snapshot
+                .to_state()
+                .map_err(DeviceManagerError::RestoreGetState)?;
+            let saved_vcpu_states = self.cpu_manager.lock().unwrap().get_saved_states();
+            interrupt_controller
+                .lock()
+                .unwrap()
+                .restore_vgic(vgic_state, &saved_vcpu_states)
+                .unwrap();
+        }
+
+        self.device_tree
+            .lock()
+            .unwrap()
+            .insert(id.clone(), device_node!(id, interrupt_controller));
 
         Ok(interrupt_controller)
     }
@@ -2134,7 +2149,7 @@ impl DeviceManager {
                         .map_err(DeviceManagerError::EventFd)?,
                     self.force_iommu,
                     snapshot
-                        .map(|s| s.to_versioned_state(&id))
+                        .map(|s| s.to_versioned_state())
                         .transpose()
                         .map_err(DeviceManagerError::RestoreGetState)?,
                 ) {
@@ -2233,7 +2248,7 @@ impl DeviceManager {
                         .try_clone()
                         .map_err(DeviceManagerError::EventFd)?,
                     snapshot
-                        .map(|s| s.to_versioned_state(&id))
+                        .map(|s| s.to_versioned_state())
                         .transpose()
                         .map_err(DeviceManagerError::RestoreGetState)?,
                 )
@@ -2316,9 +2331,12 @@ impl DeviceManager {
                         .map_err(DeviceManagerError::EventFd)?,
                     self.force_iommu,
                     snapshot
-                        .map(|s| s.to_versioned_state(&id))
+                        .map(|s| s.to_versioned_state())
                         .transpose()
                         .map_err(DeviceManagerError::RestoreGetState)?,
+                    net_cfg.offload_tso,
+                    net_cfg.offload_ufo,
+                    net_cfg.offload_csum,
                 ) {
                     Ok(vun_device) => vun_device,
                     Err(e) => {
@@ -2333,7 +2351,7 @@ impl DeviceManager {
             )
         } else {
             let state = snapshot
-                .map(|s| s.to_versioned_state(&id))
+                .map(|s| s.to_versioned_state())
                 .transpose()
                 .map_err(DeviceManagerError::RestoreGetState)?;
 
@@ -2356,6 +2374,9 @@ impl DeviceManager {
                             .try_clone()
                             .map_err(DeviceManagerError::EventFd)?,
                         state,
+                        net_cfg.offload_tso,
+                        net_cfg.offload_ufo,
+                        net_cfg.offload_csum,
                     )
                     .map_err(DeviceManagerError::CreateVirtioNet)?,
                 ))
@@ -2374,6 +2395,9 @@ impl DeviceManager {
                             .try_clone()
                             .map_err(DeviceManagerError::EventFd)?,
                         state,
+                        net_cfg.offload_tso,
+                        net_cfg.offload_ufo,
+                        net_cfg.offload_csum,
                     )
                     .map_err(DeviceManagerError::CreateVirtioNet)?,
                 ))
@@ -2396,6 +2420,9 @@ impl DeviceManager {
                             .try_clone()
                             .map_err(DeviceManagerError::EventFd)?,
                         state,
+                        net_cfg.offload_tso,
+                        net_cfg.offload_ufo,
+                        net_cfg.offload_csum,
                     )
                     .map_err(DeviceManagerError::CreateVirtioNet)?,
                 ))
@@ -3182,8 +3209,8 @@ impl DeviceManager {
             legacy_interrupt_group,
             device_cfg.iommu,
             pci_device_bdf,
-            self.restoring,
             Arc::new(move || memory_manager.lock().unwrap().allocate_memory_slot()),
+            vm_migration::snapshot_from_id(self.snapshot.as_ref(), vfio_name.as_str()),
         )
         .map_err(DeviceManagerError::VfioPciCreate)?;
 
@@ -3197,15 +3224,11 @@ impl DeviceManager {
             resources,
         )?;
 
-        // When restoring a VM, the restore codepath will take care of mapping
-        // the MMIO regions based on the information from the snapshot.
-        if !self.restoring {
-            vfio_pci_device
-                .lock()
-                .unwrap()
-                .map_mmio_regions()
-                .map_err(DeviceManagerError::VfioMapRegion)?;
-        }
+        vfio_pci_device
+            .lock()
+            .unwrap()
+            .map_mmio_regions()
+            .map_err(DeviceManagerError::VfioMapRegion)?;
 
         let mut node = device_node!(vfio_name, vfio_pci_device);
 
@@ -3341,8 +3364,8 @@ impl DeviceManager {
             self.msi_interrupt_manager.clone(),
             legacy_interrupt_group,
             pci_device_bdf,
-            self.restoring,
             Arc::new(move || memory_manager.lock().unwrap().allocate_memory_slot()),
+            vm_migration::snapshot_from_id(self.snapshot.as_ref(), vfio_user_name.as_str()),
         )
         .map_err(DeviceManagerError::VfioUserCreate)?;
 
@@ -3377,17 +3400,13 @@ impl DeviceManager {
             resources,
         )?;
 
-        // When restoring a VM, the restore codepath will take care of mapping
-        // the MMIO regions based on the information from the snapshot.
-        if !self.restoring {
-            // Note it is required to call 'add_pci_device()' in advance to have the list of
-            // mmio regions provisioned correctly
-            vfio_user_pci_device
-                .lock()
-                .unwrap()
-                .map_mmio_regions()
-                .map_err(DeviceManagerError::VfioUserMapRegion)?;
-        }
+        // Note it is required to call 'add_pci_device()' in advance to have the list of
+        // mmio regions provisioned correctly
+        vfio_user_pci_device
+            .lock()
+            .unwrap()
+            .map_mmio_regions()
+            .map_err(DeviceManagerError::VfioUserMapRegion)?;
 
         let mut node = device_node!(vfio_user_name, vfio_user_pci_device);
 
@@ -3427,7 +3446,7 @@ impl DeviceManager {
         pci_segment_id: u16,
         dma_handler: Option<Arc<dyn ExternalDmaMapping>>,
     ) -> DeviceManagerResult<PciBdf> {
-        let id = format!("{}-{}", VIRTIO_PCI_DEVICE_NAME_PREFIX, virtio_device_id);
+        let id = format!("{VIRTIO_PCI_DEVICE_NAME_PREFIX}-{virtio_device_id}");
 
         // Add the new virtio-pci node to the device tree.
         let mut node = device_node!(id);
@@ -4129,43 +4148,6 @@ impl DeviceManager {
         self.device_tree.clone()
     }
 
-    pub fn restore_devices(
-        &mut self,
-        snapshot: Snapshot,
-    ) -> std::result::Result<(), MigratableError> {
-        // Finally, restore all devices associated with the DeviceManager.
-        // It's important to restore devices in the right order, that's why
-        // the device tree is the right way to ensure we restore a child before
-        // its parent node.
-        for node in self
-            .device_tree
-            .lock()
-            .unwrap()
-            .breadth_first_traversal()
-            .rev()
-        {
-            // Restore the node
-            if let Some(migratable) = &node.migratable {
-                info!("Restoring {} from DeviceManager", node.id);
-                if let Some(snapshot) = snapshot.snapshots.get(&node.id) {
-                    migratable.lock().unwrap().pause()?;
-                    migratable.lock().unwrap().restore(*snapshot.clone())?;
-                } else {
-                    return Err(MigratableError::Restore(anyhow!(
-                        "Missing device {}",
-                        node.id
-                    )));
-                }
-            }
-        }
-
-        // The devices have been fully restored, we can now update the
-        // restoring state of the DeviceManager.
-        self.restoring = false;
-
-        Ok(())
-    }
-
     #[cfg(target_arch = "x86_64")]
     pub fn notify_power_button(&self) -> DeviceManagerResult<()> {
         self.ged_notification_device
@@ -4266,7 +4248,7 @@ impl Aml for DeviceManager {
         let mut pci_scan_methods = Vec::new();
         for i in 0..self.pci_segments.len() {
             pci_scan_methods.push(aml::MethodCall::new(
-                format!("\\_SB_.PCI{:X}.PCNT", i).as_str().into(),
+                format!("\\_SB_.PCI{i:X}.PCNT").as_str().into(),
                 vec![],
             ));
         }
@@ -4474,36 +4456,17 @@ impl Snapshottable for DeviceManager {
     }
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
-        let mut snapshot = Snapshot::new(DEVICE_MANAGER_SNAPSHOT_ID);
+        let mut snapshot = Snapshot::from_data(SnapshotData::new_from_state(&self.state())?);
 
         // We aggregate all devices snapshots.
         for (_, device_node) in self.device_tree.lock().unwrap().iter() {
             if let Some(migratable) = &device_node.migratable {
-                let device_snapshot = migratable.lock().unwrap().snapshot()?;
-                snapshot.add_snapshot(device_snapshot);
+                let mut migratable = migratable.lock().unwrap();
+                snapshot.add_snapshot(migratable.id(), migratable.snapshot()?);
             }
         }
 
-        // Then we store the DeviceManager state.
-        snapshot.add_data_section(SnapshotDataSection::new_from_state(
-            DEVICE_MANAGER_SNAPSHOT_ID,
-            &self.state(),
-        )?);
-
         Ok(snapshot)
-    }
-
-    fn restore(&mut self, snapshot: Snapshot) -> std::result::Result<(), MigratableError> {
-        // Let's first restore the DeviceManager.
-
-        self.set_state(&snapshot.to_state(DEVICE_MANAGER_SNAPSHOT_ID)?);
-
-        // Now that DeviceManager is updated with the right states, it's time
-        // to create the devices based on the configuration.
-        self.create_devices(None, None, None)
-            .map_err(|e| MigratableError::Restore(anyhow!("Could not create devices {:?}", e)))?;
-
-        Ok(())
     }
 }
 

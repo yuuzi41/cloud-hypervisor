@@ -216,7 +216,7 @@ impl<S: VhostUserMasterReqHandler> VhostUserEpollHandler<S> {
         .map_err(|e| {
             EpollHelperError::IoError(std::io::Error::new(
                 std::io::ErrorKind::Other,
-                format!("failed connecting vhost-user backend {:?}", e),
+                format!("failed connecting vhost-user backend {e:?}"),
             ))
         })?;
 
@@ -237,7 +237,7 @@ impl<S: VhostUserMasterReqHandler> VhostUserEpollHandler<S> {
             .map_err(|e| {
                 EpollHelperError::IoError(std::io::Error::new(
                     std::io::ErrorKind::Other,
-                    format!("failed reconnecting vhost-user backend{:?}", e),
+                    format!("failed reconnecting vhost-user backend{e:?}"),
                 ))
             })?;
 
@@ -430,15 +430,11 @@ impl VhostUserCommon {
         }
     }
 
-    pub fn snapshot<T>(
-        &mut self,
-        id: &str,
-        state: &T,
-    ) -> std::result::Result<Snapshot, MigratableError>
+    pub fn snapshot<T>(&mut self, state: &T) -> std::result::Result<Snapshot, MigratableError>
     where
         T: Versionize + VersionMapped,
     {
-        let snapshot = Snapshot::new_from_versioned_state(id, state)?;
+        let snapshot = Snapshot::new_from_versioned_state(state)?;
 
         if self.migration_started {
             self.shutdown();

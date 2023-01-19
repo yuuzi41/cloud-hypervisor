@@ -729,17 +729,19 @@ impl Mem {
         if region_len != region_len / VIRTIO_MEM_ALIGN_SIZE * VIRTIO_MEM_ALIGN_SIZE {
             return Err(io::Error::new(
                 io::ErrorKind::Other,
-                format!(
-                    "Virtio-mem size is not aligned with {}",
-                    VIRTIO_MEM_ALIGN_SIZE
-                ),
+                format!("Virtio-mem size is not aligned with {VIRTIO_MEM_ALIGN_SIZE}"),
             ));
         }
 
-        let (avail_features, acked_features, config) = if let Some(state) = state {
+        let (avail_features, acked_features, config, paused) = if let Some(state) = state {
             info!("Restoring virtio-mem {}", id);
             *(blocks_state.lock().unwrap()) = state.blocks_state.clone();
-            (state.avail_features, state.acked_features, state.config)
+            (
+                state.avail_features,
+                state.acked_features,
+                state.config,
+                true,
+            )
         } else {
             let mut avail_features = 1u64 << VIRTIO_F_VERSION_1;
 
@@ -758,8 +760,7 @@ impl Mem {
                     io::Error::new(
                         io::ErrorKind::Other,
                         format!(
-                            "Failed to resize virtio-mem configuration to {}: {:?}",
-                            initial_size, e
+                            "Failed to resize virtio-mem configuration to {initial_size}: {e:?}"
                         ),
                     )
                 })?;
@@ -775,11 +776,11 @@ impl Mem {
             config.validate().map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::Other,
-                    format!("Invalid virtio-mem configuration: {:?}", e),
+                    format!("Invalid virtio-mem configuration: {e:?}"),
                 )
             })?;
 
-            (avail_features, 0, config)
+            (avail_features, 0, config, false)
         };
 
         let host_fd = region
@@ -794,6 +795,7 @@ impl Mem {
                 paused_sync: Some(Arc::new(Barrier::new(2))),
                 queue_sizes: QUEUE_SIZES.to_vec(),
                 min_queues: 1,
+                paused: Arc::new(AtomicBool::new(paused)),
                 ..Default::default()
             },
             id,
@@ -900,6 +902,7 @@ impl Drop for Mem {
             // Ignore the result because there is nothing we can do about it.
             let _ = kill_evt.write(1);
         }
+        self.common.wait_for_epoll_threads();
     }
 }
 
@@ -1008,7 +1011,7 @@ impl Snapshottable for Mem {
     }
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
-        Snapshot::new_from_versioned_state(&self.id(), &self.state())
+        Snapshot::new_from_versioned_state(&self.state())
     }
 }
 impl Transportable for Mem {}

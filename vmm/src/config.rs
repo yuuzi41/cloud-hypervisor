@@ -4,7 +4,6 @@
 //
 
 pub use crate::vm_config::*;
-use clap::ArgMatches;
 use option_parser::{
     ByteSized, IntegerList, OptionParser, OptionParserError, StringList, Toggle, Tuple,
 };
@@ -134,6 +133,8 @@ pub enum ValidationError {
     VnetQueueFdMismatch,
     /// Using reserved fd
     VnetReservedFd,
+    /// Hardware checksum offload is disabled.
+    NoHardwareChecksumOffload,
     /// Hugepages not turned on
     HugePageSizeWithoutHugePages,
     /// Huge page size is not power of 2
@@ -205,11 +206,15 @@ impl fmt::Display for ValidationError {
                 "Number of queues to virtio_net does not match the number of input FDs"
             ),
             VnetReservedFd => write!(f, "Reserved fd number (<= 2)"),
+            NoHardwareChecksumOffload => write!(
+                f,
+                "\"offload_tso\" and \"offload_ufo\" depend on \"offload_tso\""
+            ),
             HugePageSizeWithoutHugePages => {
                 write!(f, "Huge page size specified but huge pages not enabled")
             }
             InvalidHugePageSize(s) => {
-                write!(f, "Huge page size is not power of 2: {}", s)
+                write!(f, "Huge page size is not power of 2: {s}")
             }
             #[cfg(feature = "tdx")]
             TdxNoCpuHotplug => {
@@ -231,56 +236,50 @@ impl fmt::Display for ValidationError {
             MemoryZoneReused(s, u1, u2) => {
                 write!(
                     f,
-                    "Memory zone: {} belongs to multiple NUMA nodes {} and {}",
-                    s, u1, u2
+                    "Memory zone: {s} belongs to multiple NUMA nodes {u1} and {u2}"
                 )
             }
             InvalidNumPciSegments(n) => {
                 write!(
                     f,
-                    "Number of PCI segments ({}) not in range of 1 to {}",
-                    n, MAX_NUM_PCI_SEGMENTS
+                    "Number of PCI segments ({n}) not in range of 1 to {MAX_NUM_PCI_SEGMENTS}"
                 )
             }
             InvalidPciSegment(pci_segment) => {
-                write!(f, "Invalid PCI segment id: {}", pci_segment)
+                write!(f, "Invalid PCI segment id: {pci_segment}")
             }
             BalloonLargerThanRam(balloon_size, ram_size) => {
                 write!(
                     f,
-                    "Ballon size ({}) greater than RAM ({})",
-                    balloon_size, ram_size
+                    "Ballon size ({balloon_size}) greater than RAM ({ram_size})"
                 )
             }
             OnIommuSegment(pci_segment) => {
                 write!(
                     f,
-                    "Device is on an IOMMU PCI segment ({}) but not placed behind IOMMU",
-                    pci_segment
+                    "Device is on an IOMMU PCI segment ({pci_segment}) but not placed behind IOMMU"
                 )
             }
             IommuNotSupportedOnSegment(pci_segment) => {
                 write!(
                     f,
-                    "Device is on an IOMMU PCI segment ({}) but does not support being placed behind IOMMU",
-                    pci_segment
+                    "Device is on an IOMMU PCI segment ({pci_segment}) but does not support being placed behind IOMMU"
                 )
             }
             IdentifierNotUnique(s) => {
-                write!(f, "Identifier {} is not unique", s)
+                write!(f, "Identifier {s} is not unique")
             }
             InvalidIdentifier(s) => {
-                write!(f, "Identifier {} is invalid", s)
+                write!(f, "Identifier {s} is invalid")
             }
             IommuNotSupported => {
                 write!(f, "Device does not support being placed behind IOMMU")
             }
-            DuplicateDevicePath(p) => write!(f, "Duplicated device path: {}", p),
+            DuplicateDevicePath(p) => write!(f, "Duplicated device path: {p}"),
             &InvalidMtu(mtu) => {
                 write!(
                     f,
-                    "Provided MTU {} is lower than 1280 (expected by VIRTIO specification)",
-                    mtu
+                    "Provided MTU {mtu} is lower than 1280 (expected by VIRTIO specification)"
                 )
             }
         }
@@ -291,51 +290,51 @@ impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         use self::Error::*;
         match self {
-            ParseConsole(o) => write!(f, "Error parsing --console: {}", o),
+            ParseConsole(o) => write!(f, "Error parsing --console: {o}"),
             ParseConsoleInvalidModeGiven => {
                 write!(f, "Error parsing --console: invalid console mode given")
             }
-            ParseCpus(o) => write!(f, "Error parsing --cpus: {}", o),
-            InvalidCpuFeatures(o) => write!(f, "Invalid feature in --cpus features list: {}", o),
-            ParseDevice(o) => write!(f, "Error parsing --device: {}", o),
+            ParseCpus(o) => write!(f, "Error parsing --cpus: {o}"),
+            InvalidCpuFeatures(o) => write!(f, "Invalid feature in --cpus features list: {o}"),
+            ParseDevice(o) => write!(f, "Error parsing --device: {o}"),
             ParseDevicePathMissing => write!(f, "Error parsing --device: path missing"),
-            ParseFileSystem(o) => write!(f, "Error parsing --fs: {}", o),
+            ParseFileSystem(o) => write!(f, "Error parsing --fs: {o}"),
             ParseFsSockMissing => write!(f, "Error parsing --fs: socket missing"),
             ParseFsTagMissing => write!(f, "Error parsing --fs: tag missing"),
-            ParsePersistentMemory(o) => write!(f, "Error parsing --pmem: {}", o),
+            ParsePersistentMemory(o) => write!(f, "Error parsing --pmem: {o}"),
             ParsePmemFileMissing => write!(f, "Error parsing --pmem: file missing"),
-            ParseVsock(o) => write!(f, "Error parsing --vsock: {}", o),
+            ParseVsock(o) => write!(f, "Error parsing --vsock: {o}"),
             ParseVsockCidMissing => write!(f, "Error parsing --vsock: cid missing"),
             ParseVsockSockMissing => write!(f, "Error parsing --vsock: socket missing"),
-            ParseMemory(o) => write!(f, "Error parsing --memory: {}", o),
-            ParseMemoryZone(o) => write!(f, "Error parsing --memory-zone: {}", o),
+            ParseMemory(o) => write!(f, "Error parsing --memory: {o}"),
+            ParseMemoryZone(o) => write!(f, "Error parsing --memory-zone: {o}"),
             ParseMemoryZoneIdMissing => write!(f, "Error parsing --memory-zone: id missing"),
-            ParseNetwork(o) => write!(f, "Error parsing --net: {}", o),
-            ParseDisk(o) => write!(f, "Error parsing --disk: {}", o),
-            ParseRng(o) => write!(f, "Error parsing --rng: {}", o),
-            ParseBalloon(o) => write!(f, "Error parsing --balloon: {}", o),
-            ParseRestore(o) => write!(f, "Error parsing --restore: {}", o),
+            ParseNetwork(o) => write!(f, "Error parsing --net: {o}"),
+            ParseDisk(o) => write!(f, "Error parsing --disk: {o}"),
+            ParseRng(o) => write!(f, "Error parsing --rng: {o}"),
+            ParseBalloon(o) => write!(f, "Error parsing --balloon: {o}"),
+            ParseRestore(o) => write!(f, "Error parsing --restore: {o}"),
             #[cfg(target_arch = "x86_64")]
-            ParseSgxEpc(o) => write!(f, "Error parsing --sgx-epc: {}", o),
+            ParseSgxEpc(o) => write!(f, "Error parsing --sgx-epc: {o}"),
             #[cfg(target_arch = "x86_64")]
             ParseSgxEpcIdMissing => write!(f, "Error parsing --sgx-epc: id missing"),
-            ParseNuma(o) => write!(f, "Error parsing --numa: {}", o),
+            ParseNuma(o) => write!(f, "Error parsing --numa: {o}"),
             ParseRestoreSourceUrlMissing => {
                 write!(f, "Error parsing --restore: source_url missing")
             }
             ParseUserDeviceSocketMissing => {
                 write!(f, "Error parsing --user-device: socket missing")
             }
-            ParseUserDevice(o) => write!(f, "Error parsing --user-device: {}", o),
-            Validation(v) => write!(f, "Error validating configuration: {}", v),
+            ParseUserDevice(o) => write!(f, "Error parsing --user-device: {o}"),
+            Validation(v) => write!(f, "Error validating configuration: {v}"),
             #[cfg(feature = "tdx")]
-            ParseTdx(o) => write!(f, "Error parsing --tdx: {}", o),
+            ParseTdx(o) => write!(f, "Error parsing --tdx: {o}"),
             #[cfg(feature = "tdx")]
             FirmwarePathMissing => write!(f, "TDX firmware missing"),
-            ParsePlatform(o) => write!(f, "Error parsing --platform: {}", o),
-            ParseVdpa(o) => write!(f, "Error parsing --vdpa: {}", o),
+            ParsePlatform(o) => write!(f, "Error parsing --platform: {o}"),
+            ParseVdpa(o) => write!(f, "Error parsing --vdpa: {o}"),
             ParseVdpaPathMissing => write!(f, "Error parsing --vdpa: path missing"),
-            ParseTpm(o) => write!(f, "Error parsing --tpm: {}", o),
+            ParseTpm(o) => write!(f, "Error parsing --tpm: {o}"),
             ParseTpmPathMissing => write!(f, "Error parsing --tpm: path missing"),
         }
     }
@@ -379,88 +378,6 @@ pub struct VmParams<'a> {
     pub gdb: bool,
     pub platform: Option<&'a str>,
     pub tpm: Option<&'a str>,
-}
-
-impl<'a> VmParams<'a> {
-    pub fn from_arg_matches(args: &'a ArgMatches) -> Self {
-        // These .unwrap()s cannot fail as there is a default value defined
-        let cpus = args.get_one::<String>("cpus").unwrap();
-        let memory = args.get_one::<String>("memory").unwrap();
-        let memory_zones: Option<Vec<&str>> = args
-            .get_many::<String>("memory-zone")
-            .map(|x| x.map(|y| y as &str).collect());
-        let rng = args.get_one::<String>("rng").unwrap();
-        let serial = args.get_one::<String>("serial").unwrap();
-        let firmware = args.get_one::<String>("firmware").map(|x| x as &str);
-        let kernel = args.get_one::<String>("kernel").map(|x| x as &str);
-        let initramfs = args.get_one::<String>("initramfs").map(|x| x as &str);
-        let cmdline = args.get_one::<String>("cmdline").map(|x| x as &str);
-        let disks: Option<Vec<&str>> = args
-            .get_many::<String>("disk")
-            .map(|x| x.map(|y| y as &str).collect());
-        let net: Option<Vec<&str>> = args
-            .get_many::<String>("net")
-            .map(|x| x.map(|y| y as &str).collect());
-        let console = args.get_one::<String>("console").unwrap();
-        let balloon = args.get_one::<String>("balloon").map(|x| x as &str);
-        let fs: Option<Vec<&str>> = args
-            .get_many::<String>("fs")
-            .map(|x| x.map(|y| y as &str).collect());
-        let pmem: Option<Vec<&str>> = args
-            .get_many::<String>("pmem")
-            .map(|x| x.map(|y| y as &str).collect());
-        let devices: Option<Vec<&str>> = args
-            .get_many::<String>("device")
-            .map(|x| x.map(|y| y as &str).collect());
-        let user_devices: Option<Vec<&str>> = args
-            .get_many::<String>("user-device")
-            .map(|x| x.map(|y| y as &str).collect());
-        let vdpa: Option<Vec<&str>> = args
-            .get_many::<String>("vdpa")
-            .map(|x| x.map(|y| y as &str).collect());
-        let vsock: Option<&str> = args.get_one::<String>("vsock").map(|x| x as &str);
-        #[cfg(target_arch = "x86_64")]
-        let sgx_epc: Option<Vec<&str>> = args
-            .get_many::<String>("sgx-epc")
-            .map(|x| x.map(|y| y as &str).collect());
-        let numa: Option<Vec<&str>> = args
-            .get_many::<String>("numa")
-            .map(|x| x.map(|y| y as &str).collect());
-        let watchdog = args.get_flag("watchdog");
-        let platform = args.get_one::<String>("platform").map(|x| x as &str);
-        #[cfg(feature = "guest_debug")]
-        let gdb = args.contains_id("gdb");
-        let tpm: Option<&str> = args.get_one::<String>("tpm").map(|x| x as &str);
-        VmParams {
-            cpus,
-            memory,
-            memory_zones,
-            firmware,
-            kernel,
-            initramfs,
-            cmdline,
-            disks,
-            net,
-            rng,
-            balloon,
-            fs,
-            pmem,
-            serial,
-            console,
-            devices,
-            user_devices,
-            vdpa,
-            vsock,
-            #[cfg(target_arch = "x86_64")]
-            sgx_epc,
-            numa,
-            watchdog,
-            #[cfg(feature = "guest_debug")]
-            gdb,
-            platform,
-            tpm,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -827,14 +744,6 @@ impl MemoryConfig {
 }
 
 impl DiskConfig {
-    pub const SYNTAX: &'static str = "Disk parameters \
-         \"path=<disk_image_path>,readonly=on|off,direct=on|off,iommu=on|off,\
-         num_queues=<number_of_queues>,queue_size=<size_of_each_queue>,\
-         vhost_user=on|off,socket=<vhost_user_socket_path>,\
-         bw_size=<bytes>,bw_one_time_burst=<bytes>,bw_refill_time=<ms>,\
-         ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,\
-         id=<device_id>,pci_segment=<segment_id>\"";
-
     pub fn parse(disk: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser
@@ -1007,13 +916,6 @@ impl FromStr for VhostMode {
 }
 
 impl NetConfig {
-    pub const SYNTAX: &'static str = "Network parameters \
-    \"tap=<if_name>,ip=<ip_addr>,mask=<net_mask>,mac=<mac_addr>,fd=<fd1,fd2...>,iommu=on|off,\
-    num_queues=<number_of_queues>,queue_size=<size_of_each_queue>,id=<device_id>,\
-    vhost_user=<vhost_user_enable>,socket=<vhost_user_socket_path>,vhost_mode=client|server,\
-    bw_size=<bytes>,bw_one_time_burst=<bytes>,bw_refill_time=<ms>,\
-    ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,pci_segment=<segment_id>\"";
-
     pub fn parse(net: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
 
@@ -1023,6 +925,9 @@ impl NetConfig {
             .add("mask")
             .add("mac")
             .add("host_mac")
+            .add("offload_tso")
+            .add("offload_ufo")
+            .add("offload_csum")
             .add("mtu")
             .add("iommu")
             .add("queue_size")
@@ -1055,6 +960,21 @@ impl NetConfig {
             .map_err(Error::ParseNetwork)?
             .unwrap_or_else(default_netconfig_mac);
         let host_mac = parser.convert("host_mac").map_err(Error::ParseNetwork)?;
+        let offload_tso = parser
+            .convert::<Toggle>("offload_tso")
+            .map_err(Error::ParseNetwork)?
+            .unwrap_or(Toggle(true))
+            .0;
+        let offload_ufo = parser
+            .convert::<Toggle>("offload_ufo")
+            .map_err(Error::ParseNetwork)?
+            .unwrap_or(Toggle(true))
+            .0;
+        let offload_csum = parser
+            .convert::<Toggle>("offload_csum")
+            .map_err(Error::ParseNetwork)?
+            .unwrap_or(Toggle(true))
+            .0;
         let mtu = parser.convert("mtu").map_err(Error::ParseNetwork)?;
         let iommu = parser
             .convert::<Toggle>("iommu")
@@ -1156,6 +1076,9 @@ impl NetConfig {
             fds,
             rate_limiter_config,
             pci_segment,
+            offload_tso,
+            offload_ufo,
+            offload_csum,
         };
         Ok(config)
     }
@@ -1203,6 +1126,10 @@ impl NetConfig {
             }
         }
 
+        if !self.offload_csum && (self.offload_tso || self.offload_ufo) {
+            return Err(ValidationError::NoHardwareChecksumOffload);
+        }
+
         Ok(())
     }
 }
@@ -1229,10 +1156,6 @@ impl RngConfig {
 }
 
 impl BalloonConfig {
-    pub const SYNTAX: &'static str =
-        "Balloon parameters \"size=<balloon_size>,deflate_on_oom=on|off,\
-        free_page_reporting=on|off\"";
-
     pub fn parse(balloon: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser.add("size");
@@ -1267,10 +1190,6 @@ impl BalloonConfig {
 }
 
 impl FsConfig {
-    pub const SYNTAX: &'static str = "virtio-fs parameters \
-    \"tag=<tag_name>,socket=<socket_path>,num_queues=<number_of_queues>,\
-    queue_size=<size_of_each_queue>,id=<device_id>,pci_segment=<segment_id>\"";
-
     pub fn parse(fs: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser
@@ -1335,9 +1254,6 @@ impl FsConfig {
 }
 
 impl PmemConfig {
-    pub const SYNTAX: &'static str = "Persistent memory parameters \
-    \"file=<backing_file_path>,size=<persistent_memory_size>,iommu=on|off,\
-    discard_writes=on|off,id=<device_id>,pci_segment=<segment_id>\"";
     pub fn parse(pmem: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser
@@ -1439,8 +1355,6 @@ impl ConsoleConfig {
 }
 
 impl DeviceConfig {
-    pub const SYNTAX: &'static str =
-        "Direct device assignment parameters \"path=<device_path>,iommu=on|off,id=<device_id>,pci_segment=<segment_id>\"";
     pub fn parse(device: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser.add("path").add("id").add("iommu").add("pci_segment");
@@ -1487,8 +1401,6 @@ impl DeviceConfig {
 }
 
 impl UserDeviceConfig {
-    pub const SYNTAX: &'static str =
-        "Userspace device socket=<socket_path>,id=<device_id>,pci_segment=<segment_id>\"";
     pub fn parse(user_device: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser.add("socket").add("id").add("pci_segment");
@@ -1531,9 +1443,6 @@ impl UserDeviceConfig {
 }
 
 impl VdpaConfig {
-    pub const SYNTAX: &'static str = "vDPA device \
-        \"path=<device_path>,num_queues=<number_of_queues>,iommu=on|off,\
-        id=<device_id>,pci_segment=<segment_id>\"";
     pub fn parse(vdpa: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser
@@ -1590,8 +1499,6 @@ impl VdpaConfig {
 }
 
 impl VsockConfig {
-    pub const SYNTAX: &'static str = "Virtio VSOCK parameters \
-        \"cid=<context_id>,socket=<socket_path>,iommu=on|off,id=<device_id>,pci_segment=<segment_id>\"";
     pub fn parse(vsock: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser
@@ -1649,8 +1556,6 @@ impl VsockConfig {
 
 #[cfg(target_arch = "x86_64")]
 impl SgxEpcConfig {
-    pub const SYNTAX: &'static str = "SGX EPC parameters \
-        \"id=<epc_section_identifier>,size=<epc_section_size>,prefault=on|off\"";
     pub fn parse(sgx_epc: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser.add("id").add("size").add("prefault");
@@ -1673,9 +1578,6 @@ impl SgxEpcConfig {
 }
 
 impl NumaConfig {
-    pub const SYNTAX: &'static str = "Settings related to a given NUMA node \
-        \"guest_numa_id=<node_id>,cpus=<cpus_id>,distances=<list_of_distances_to_destination_nodes>,\
-        memory_zones=<list_of_memory_zones>,sgx_epc_sections=<list_of_sgx_epc_sections>\"";
     pub fn parse(numa: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser
@@ -1734,10 +1636,6 @@ pub struct RestoreConfig {
 }
 
 impl RestoreConfig {
-    pub const SYNTAX: &'static str = "Restore from a VM snapshot. \
-        \nRestore parameters \"source_url=<source_url>,prefault=on|off\" \
-        \n`source_url` should be a valid URL (e.g file:///foo/bar or tcp://192.168.1.10/foo) \
-        \n`prefault` brings memory pages in when enabled (disabled by default)";
     pub fn parse(restore: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser.add("source_url").add("prefault");
@@ -1761,8 +1659,6 @@ impl RestoreConfig {
 }
 
 impl TpmConfig {
-    pub const SYNTAX: &'static str = "TPM device \
-        \"(UNIX Domain Socket from swtpm) socket=</path/to/a/socket>\"";
     pub fn parse(tpm: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser.add("socket");
@@ -2936,6 +2832,16 @@ mod tests {
         assert_eq!(
             invalid_config.validate(),
             Err(ValidationError::VnetReservedFd)
+        );
+
+        let mut invalid_config = valid_config.clone();
+        invalid_config.net = Some(vec![NetConfig {
+            offload_csum: false,
+            ..Default::default()
+        }]);
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::NoHardwareChecksumOffload)
         );
 
         let mut invalid_config = valid_config.clone();

@@ -18,8 +18,6 @@
 //! - arm64
 //!
 
-#![allow(clippy::significant_drop_in_scrutinee)]
-
 #[macro_use]
 extern crate anyhow;
 #[cfg(target_arch = "x86_64")]
@@ -63,7 +61,9 @@ pub use vm::{
 
 #[derive(Debug, Copy, Clone)]
 pub enum HypervisorType {
+    #[cfg(feature = "kvm")]
     Kvm,
+    #[cfg(feature = "mshv")]
     Mshv,
 }
 

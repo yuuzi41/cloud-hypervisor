@@ -2,12 +2,9 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 
-#[cfg(feature = "guest_debug")]
+#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::coredump::GuestDebuggableError;
-use crate::{
-    config::VmConfig,
-    vm::{VmSnapshot, VM_SNAPSHOT_ID},
-};
+use crate::{config::VmConfig, vm::VmSnapshot};
 use anyhow::anyhow;
 use std::fs::File;
 use std::io::BufReader;
@@ -34,7 +31,7 @@ pub fn url_to_path(url: &str) -> std::result::Result<PathBuf, MigratableError> {
     Ok(path)
 }
 
-#[cfg(feature = "guest_debug")]
+#[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 pub fn url_to_file(url: &str) -> std::result::Result<PathBuf, GuestDebuggableError> {
     let file: PathBuf = url
         .strip_prefix("file://")
@@ -71,13 +68,8 @@ pub fn recv_vm_state(source_url: &str) -> std::result::Result<Snapshot, Migratab
 }
 
 pub fn get_vm_snapshot(snapshot: &Snapshot) -> std::result::Result<VmSnapshot, MigratableError> {
-    if let Some(vm_section) = snapshot
-        .snapshot_data
-        .get(&format!("{}-section", VM_SNAPSHOT_ID))
-    {
-        return serde_json::from_slice(&vm_section.snapshot).map_err(|e| {
-            MigratableError::Restore(anyhow!("Could not deserialize VM snapshot {}", e))
-        });
+    if let Some(snapshot_data) = snapshot.snapshot_data.as_ref() {
+        return snapshot_data.to_state();
     }
 
     Err(MigratableError::Restore(anyhow!(

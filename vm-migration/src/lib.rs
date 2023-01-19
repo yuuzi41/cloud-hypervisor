@@ -12,7 +12,7 @@ use versionize::{VersionMap, Versionize};
 pub mod protocol;
 
 /// Global VMM version for versioning
-const MAJOR_VERSION: u16 = 28;
+const MAJOR_VERSION: u16 = 29;
 const MINOR_VERSION: u16 = 0;
 const VMM_VERSION: u16 = MAJOR_VERSION << 12 | MINOR_VERSION & 0b1111;
 
@@ -80,23 +80,16 @@ pub trait Pausable {
 /// Splitting a component migration data into different sections
 /// allows for easier and forward compatible extensions.
 #[derive(Clone, Default, Deserialize, Serialize)]
-pub struct SnapshotDataSection {
-    /// The section id.
-    pub id: String,
+pub struct SnapshotData(pub Vec<u8>);
 
-    /// The section serialized snapshot.
-    pub snapshot: Vec<u8>,
-}
-
-impl SnapshotDataSection {
+impl SnapshotData {
     /// Generate the state data from the snapshot data
     pub fn to_state<'a, T>(&'a self) -> Result<T, MigratableError>
     where
         T: Deserialize<'a>,
     {
-        serde_json::from_slice(&self.snapshot).map_err(|e| {
-            MigratableError::Restore(anyhow!("Error deserialising: {} {}", self.id, e))
-        })
+        serde_json::from_slice(&self.0)
+            .map_err(|e| MigratableError::Restore(anyhow!("Error deserialising: {}", e)))
     }
 
     /// Generate versioned state
@@ -104,46 +97,32 @@ impl SnapshotDataSection {
     where
         T: Versionize + VersionMapped,
     {
-        T::deserialize(
-            &mut self.snapshot.as_slice(),
-            &T::version_map(),
-            VMM_VERSION,
-        )
-        .map_err(|e| MigratableError::Restore(anyhow!("Error deserialising: {} {}", self.id, e)))
+        T::deserialize(&mut self.0.as_slice(), &T::version_map(), VMM_VERSION)
+            .map_err(|e| MigratableError::Restore(anyhow!("Error deserialising: {}", e)))
     }
 
     /// Create from state that can be serialized
-    pub fn new_from_state<T>(id: &str, state: &T) -> Result<Self, MigratableError>
+    pub fn new_from_state<T>(state: &T) -> Result<Self, MigratableError>
     where
         T: Serialize,
     {
-        let snapshot = serde_json::to_vec(state)
-            .map_err(|e| MigratableError::Snapshot(anyhow!("Error serialising: {} {}", id, e)))?;
+        let data = serde_json::to_vec(state)
+            .map_err(|e| MigratableError::Snapshot(anyhow!("Error serialising: {}", e)))?;
 
-        let snapshot_data = SnapshotDataSection {
-            id: format!("{}-section", id),
-            snapshot,
-        };
-
-        Ok(snapshot_data)
+        Ok(SnapshotData(data))
     }
 
     /// Create from versioned state
-    pub fn new_from_versioned_state<T>(id: &str, state: &T) -> Result<Self, MigratableError>
+    pub fn new_from_versioned_state<T>(state: &T) -> Result<Self, MigratableError>
     where
         T: Versionize + VersionMapped,
     {
-        let mut snapshot = Vec::new();
+        let mut data = Vec::new();
         state
-            .serialize(&mut snapshot, &T::version_map(), VMM_VERSION)
-            .map_err(|e| MigratableError::Snapshot(anyhow!("Error serialising: {} {}", id, e)))?;
+            .serialize(&mut data, &T::version_map(), VMM_VERSION)
+            .map_err(|e| MigratableError::Snapshot(anyhow!("Error serialising: {}", e)))?;
 
-        let snapshot_data = SnapshotDataSection {
-            id: format!("{}-section", id),
-            snapshot,
-        };
-
-        Ok(snapshot_data)
+        Ok(SnapshotData(data))
     }
 }
 
@@ -156,88 +135,74 @@ impl SnapshotDataSection {
 /// For example, a device manager snapshot is the composition of all its
 /// devices snapshots. The device manager Snapshot would have no snapshot_data
 /// but one Snapshot child per tracked device. Then each device's Snapshot
-/// would carry an empty snapshots map but a map of SnapshotDataSection, i.e.
+/// would carry an empty snapshots map but a map of SnapshotData, i.e.
 /// the actual device snapshot data.
 #[derive(Clone, Default, Deserialize, Serialize)]
 pub struct Snapshot {
-    /// The Snapshottable component id.
-    pub id: String,
-
     /// The Snapshottable component snapshots.
-    pub snapshots: std::collections::BTreeMap<String, Box<Snapshot>>,
+    pub snapshots: std::collections::BTreeMap<String, Snapshot>,
 
     /// The Snapshottable component's snapshot data.
     /// A map of snapshot sections, indexed by the section ids.
-    pub snapshot_data: std::collections::HashMap<String, SnapshotDataSection>,
+    pub snapshot_data: Option<SnapshotData>,
 }
 
 impl Snapshot {
-    /// Create an empty Snapshot.
-    pub fn new(id: &str) -> Self {
+    pub fn from_data(data: SnapshotData) -> Self {
         Snapshot {
-            id: id.to_string(),
+            snapshot_data: Some(data),
             ..Default::default()
         }
     }
 
     /// Create from state that can be serialized
-    pub fn new_from_state<T>(id: &str, state: &T) -> Result<Self, MigratableError>
+    pub fn new_from_state<T>(state: &T) -> Result<Self, MigratableError>
     where
         T: Serialize,
     {
-        let mut snapshot_data = Snapshot::new(id);
-        snapshot_data.add_data_section(SnapshotDataSection::new_from_state(id, state)?);
-
-        Ok(snapshot_data)
+        Ok(Snapshot::from_data(SnapshotData::new_from_state(state)?))
     }
 
     /// Create from versioned state
-    pub fn new_from_versioned_state<T>(id: &str, state: &T) -> Result<Self, MigratableError>
+    pub fn new_from_versioned_state<T>(state: &T) -> Result<Self, MigratableError>
     where
         T: Versionize + VersionMapped,
     {
-        let mut snapshot_data = Snapshot::new(id);
-        snapshot_data.add_data_section(SnapshotDataSection::new_from_versioned_state(id, state)?);
-
-        Ok(snapshot_data)
+        Ok(Snapshot::from_data(SnapshotData::new_from_versioned_state(
+            state,
+        )?))
     }
 
     /// Add a sub-component's Snapshot to the Snapshot.
-    pub fn add_snapshot(&mut self, snapshot: Snapshot) {
-        self.snapshots
-            .insert(snapshot.id.clone(), Box::new(snapshot));
-    }
-
-    /// Add a SnapshotDatasection to the component snapshot data.
-    pub fn add_data_section(&mut self, section: SnapshotDataSection) {
-        self.snapshot_data.insert(section.id.clone(), section);
+    pub fn add_snapshot(&mut self, id: String, snapshot: Snapshot) {
+        self.snapshots.insert(id, snapshot);
     }
 
     /// Generate the state data from the snapshot
-    pub fn to_state<'a, T>(&'a self, id: &str) -> Result<T, MigratableError>
+    pub fn to_state<'a, T>(&'a self) -> Result<T, MigratableError>
     where
         T: Deserialize<'a>,
     {
         self.snapshot_data
-            .get(&format!("{}-section", id))
-            .ok_or_else(|| MigratableError::Restore(anyhow!("Missing section for {}", id)))?
+            .as_ref()
+            .ok_or_else(|| MigratableError::Restore(anyhow!("Missing snapshot data")))?
             .to_state()
     }
 
     /// Generate versioned state
-    pub fn to_versioned_state<T>(&self, id: &str) -> Result<T, MigratableError>
+    pub fn to_versioned_state<T>(&self) -> Result<T, MigratableError>
     where
         T: Versionize + VersionMapped,
     {
         self.snapshot_data
-            .get(&format!("{}-section", id))
-            .ok_or_else(|| MigratableError::Restore(anyhow!("Missing section for {}", id)))?
+            .as_ref()
+            .ok_or_else(|| MigratableError::Restore(anyhow!("Missing snapshot data")))?
             .to_versioned_state()
     }
 }
 
 pub fn snapshot_from_id(snapshot: Option<&Snapshot>, id: &str) -> Option<Snapshot> {
-    snapshot.and_then(|s| s.snapshots.get(id).map(|s| *s.clone()))
+    snapshot.and_then(|s| s.snapshots.get(id).cloned())
 }
 
 pub fn versioned_state_from_id<T>(
@@ -248,8 +213,8 @@ where
     T: Versionize + VersionMapped,
 {
     snapshot
-        .and_then(|s| s.snapshots.get(id).map(|s| *s.clone()))
-        .map(|s| s.to_versioned_state(id))
+        .and_then(|s| s.snapshots.get(id).cloned())
+        .map(|s| s.to_versioned_state())
         .transpose()
 }
 
@@ -262,12 +227,7 @@ pub trait Snapshottable: Pausable {
 
     /// Take a component snapshot.
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
-        Ok(Snapshot::new(""))
-    }
-
-    /// Restore a component from its snapshot.
-    fn restore(&mut self, _snapshot: Snapshot) -> std::result::Result<(), MigratableError> {
-        Ok(())
+        Ok(Snapshot::default())
     }
 }
 
@@ -298,7 +258,7 @@ pub trait Transportable: Pausable + Snapshottable {
     /// * `source_url` - The source URL to fetch the snapshot from. This could be an HTTP
     ///                  endpoint, a TCP address or a local file.
     fn recv(&self, _source_url: &str) -> std::result::Result<Snapshot, MigratableError> {
-        Ok(Snapshot::new(""))
+        Ok(Snapshot::default())
     }
 }
 

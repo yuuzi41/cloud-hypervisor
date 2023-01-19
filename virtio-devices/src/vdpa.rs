@@ -12,7 +12,10 @@ use anyhow::anyhow;
 use std::{
     collections::BTreeMap,
     io, result,
-    sync::{atomic::Ordering, Arc, Mutex},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
+    },
 };
 use thiserror::Error;
 use versionize::{VersionMap, Versionize, VersionizeResult};
@@ -134,6 +137,7 @@ impl Vdpa {
             queue_sizes,
             iova_range,
             backend_features,
+            paused,
         ) = if let Some(state) = state {
             info!("Restoring vDPA {}", id);
 
@@ -152,6 +156,7 @@ impl Vdpa {
                     last: state.iova_range_last,
                 },
                 state.backend_features,
+                true,
             )
         } else {
             let device_type = vhost.get_device_id().map_err(Error::GetDeviceId)?;
@@ -175,6 +180,7 @@ impl Vdpa {
                 vec![queue_size; num_queues as usize],
                 iova_range,
                 backend_features,
+                false,
             )
         };
 
@@ -185,6 +191,7 @@ impl Vdpa {
                 avail_features,
                 acked_features,
                 min_queues: num_queues,
+                paused: Arc::new(AtomicBool::new(paused)),
                 ..Default::default()
             },
             id,
@@ -482,12 +489,9 @@ impl Snapshottable for Vdpa {
             )));
         }
 
-        let snapshot = Snapshot::new_from_versioned_state(
-            &self.id(),
-            &self.state().map_err(|e| {
-                MigratableError::Snapshot(anyhow!("Error snapshotting vDPA device: {:?}", e))
-            })?,
-        )?;
+        let snapshot = Snapshot::new_from_versioned_state(&self.state().map_err(|e| {
+            MigratableError::Snapshot(anyhow!("Error snapshotting vDPA device: {:?}", e))
+        })?)?;
 
         // Force the vhost handler to be dropped in order to close the vDPA
         // file. This will ensure the device can be accessed if the VM is
@@ -544,9 +548,8 @@ impl<M: GuestAddressSpace + Sync + Send> ExternalDmaMapping for VdpaDmaMapping<M
             return Err(io::Error::new(
                 io::ErrorKind::Other,
                 format!(
-                    "failed to convert guest address 0x{:x} into \
-                     host user virtual address",
-                    gpa
+                    "failed to convert guest address 0x{gpa:x} into \
+                     host user virtual address"
                 ),
             ));
         };
@@ -564,8 +567,7 @@ impl<M: GuestAddressSpace + Sync + Send> ExternalDmaMapping for VdpaDmaMapping<M
                     io::ErrorKind::Other,
                     format!(
                         "failed to map memory for vDPA device, \
-                         iova 0x{:x}, gpa 0x{:x}, size 0x{:x}: {:?}",
-                        iova, gpa, size, e
+                         iova 0x{iova:x}, gpa 0x{gpa:x}, size 0x{size:x}: {e:?}"
                     ),
                 )
             })
@@ -582,8 +584,7 @@ impl<M: GuestAddressSpace + Sync + Send> ExternalDmaMapping for VdpaDmaMapping<M
                     io::ErrorKind::Other,
                     format!(
                         "failed to unmap memory for vDPA device, \
-                     iova 0x{:x}, size 0x{:x}: {:?}",
-                        iova, size, e
+                     iova 0x{iova:x}, size 0x{size:x}: {e:?}"
                     ),
                 )
             })

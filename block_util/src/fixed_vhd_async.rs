@@ -64,7 +64,7 @@ impl AsyncIo for FixedVhdAsync {
     fn read_vectored(
         &mut self,
         offset: libc::off_t,
-        iovecs: Vec<libc::iovec>,
+        iovecs: &[libc::iovec],
         user_data: u64,
     ) -> AsyncIoResult<()> {
         if offset as u64 >= self.size {
@@ -83,7 +83,7 @@ impl AsyncIo for FixedVhdAsync {
     fn write_vectored(
         &mut self,
         offset: libc::off_t,
-        iovecs: Vec<libc::iovec>,
+        iovecs: &[libc::iovec],
         user_data: u64,
     ) -> AsyncIoResult<()> {
         if offset as u64 >= self.size {
@@ -104,7 +104,7 @@ impl AsyncIo for FixedVhdAsync {
         self.raw_file_async.fsync(user_data)
     }
 
-    fn complete(&mut self) -> Vec<(u64, i32)> {
-        self.raw_file_async.complete()
+    fn next_completed_request(&mut self) -> Option<(u64, i32)> {
+        self.raw_file_async.next_completed_request()
     }
 }

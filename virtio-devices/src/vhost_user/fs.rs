@@ -16,6 +16,7 @@ use seccompiler::SeccompAction;
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::result;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Barrier, Mutex};
 use std::thread;
 use versionize::{VersionMap, Versionize, VersionizeResult};
@@ -333,6 +334,7 @@ impl Fs {
             vu_num_queues,
             config,
             slave_req_support,
+            paused,
         ) = if let Some(state) = state {
             info!("Restoring vhost-user-fs {}", id);
 
@@ -348,6 +350,7 @@ impl Fs {
                 state.vu_num_queues,
                 state.config,
                 state.slave_req_support,
+                true,
             )
         } else {
             // Filling device and vring features VMM supports.
@@ -407,6 +410,7 @@ impl Fs {
                 num_queues,
                 config,
                 slave_req_support,
+                false,
             )
         };
 
@@ -418,6 +422,7 @@ impl Fs {
                 queue_sizes: vec![queue_size; num_queues],
                 paused_sync: Some(Arc::new(Barrier::new(2))),
                 min_queues: 1,
+                paused: Arc::new(AtomicBool::new(paused)),
                 ..Default::default()
             },
             vu_common: VhostUserCommon {
@@ -456,6 +461,12 @@ impl Drop for Fs {
         if let Some(kill_evt) = self.common.kill_evt.take() {
             // Ignore the result because there is nothing we can do about it.
             let _ = kill_evt.write(1);
+        }
+        self.common.wait_for_epoll_threads();
+        if let Some(thread) = self.epoll_thread.take() {
+            if let Err(e) = thread.join() {
+                error!("Error joining thread: {:?}", e);
+            }
         }
     }
 }
@@ -646,7 +657,7 @@ impl Snapshottable for Fs {
     }
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
-        self.vu_common.snapshot(&self.id(), &self.state())
+        self.vu_common.snapshot(&self.state())
     }
 }
 impl Transportable for Fs {}

@@ -76,7 +76,7 @@ impl AsyncIo for RawFileAsync {
     fn read_vectored(
         &mut self,
         offset: libc::off_t,
-        iovecs: Vec<libc::iovec>,
+        iovecs: &[libc::iovec],
         user_data: u64,
     ) -> AsyncIoResult<()> {
         let (submitter, mut sq, _) = self.io_uring.split();
@@ -104,7 +104,7 @@ impl AsyncIo for RawFileAsync {
     fn write_vectored(
         &mut self,
         offset: libc::off_t,
-        iovecs: Vec<libc::iovec>,
+        iovecs: &[libc::iovec],
         user_data: u64,
     ) -> AsyncIoResult<()> {
         let (submitter, mut sq, _) = self.io_uring.split();
@@ -155,14 +155,10 @@ impl AsyncIo for RawFileAsync {
         Ok(())
     }
 
-    fn complete(&mut self) -> Vec<(u64, i32)> {
-        let mut completion_list = Vec::new();
-
-        let cq = self.io_uring.completion();
-        for cq_entry in cq {
-            completion_list.push((cq_entry.user_data(), cq_entry.result()));
-        }
-
-        completion_list
+    fn next_completed_request(&mut self) -> Option<(u64, i32)> {
+        self.io_uring
+            .completion()
+            .next()
+            .map(|entry| (entry.user_data(), entry.result()))
     }
 }

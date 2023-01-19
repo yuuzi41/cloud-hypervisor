@@ -3,7 +3,6 @@
 // SPDX-License-Identifier: Apache-2.0 OR BSD-3-Clause
 //
 
-use anyhow::anyhow;
 use byteorder::{ByteOrder, LittleEndian};
 use std::io;
 use std::sync::Arc;
@@ -39,12 +38,14 @@ pub fn msi_num_enabled_vectors(msg_ctl: u16) -> usize {
 }
 
 #[derive(Error, Debug)]
-enum Error {
+pub enum Error {
     #[error("Failed enabling the interrupt route: {0}")]
     EnableInterruptRoute(io::Error),
     #[error("Failed updating the interrupt route: {0}")]
     UpdateInterruptRoute(io::Error),
 }
+
+pub const MSI_CONFIG_ID: &str = "msi_config";
 
 #[derive(Clone, Copy, Default, Versionize)]
 pub struct MsiCap {
@@ -172,7 +173,7 @@ impl MsiCap {
 }
 
 #[derive(Versionize)]
-struct MsiConfigState {
+pub struct MsiConfigState {
     cap: MsiCap,
 }
 
@@ -184,49 +185,51 @@ pub struct MsiConfig {
 }
 
 impl MsiConfig {
-    pub fn new(msg_ctl: u16, interrupt_source_group: Arc<dyn InterruptSourceGroup>) -> Self {
-        let cap = MsiCap {
-            msg_ctl,
-            ..Default::default()
+    pub fn new(
+        msg_ctl: u16,
+        interrupt_source_group: Arc<dyn InterruptSourceGroup>,
+        state: Option<MsiConfigState>,
+    ) -> Result<Self, Error> {
+        let cap = if let Some(state) = state {
+            if state.cap.enabled() {
+                for idx in 0..state.cap.num_enabled_vectors() {
+                    let config = MsiIrqSourceConfig {
+                        high_addr: state.cap.msg_addr_hi,
+                        low_addr: state.cap.msg_addr_lo,
+                        data: state.cap.msg_data as u32,
+                        devid: 0,
+                    };
+
+                    interrupt_source_group
+                        .update(
+                            idx as InterruptIndex,
+                            InterruptSourceConfig::MsiIrq(config),
+                            state.cap.vector_masked(idx),
+                        )
+                        .map_err(Error::UpdateInterruptRoute)?;
+                }
+
+                interrupt_source_group
+                    .enable()
+                    .map_err(Error::EnableInterruptRoute)?;
+            }
+
+            state.cap
+        } else {
+            MsiCap {
+                msg_ctl,
+                ..Default::default()
+            }
         };
 
-        MsiConfig {
+        Ok(MsiConfig {
             cap,
             interrupt_source_group,
-        }
+        })
     }
 
     fn state(&self) -> MsiConfigState {
         MsiConfigState { cap: self.cap }
-    }
-
-    fn set_state(&mut self, state: &MsiConfigState) -> Result<(), Error> {
-        self.cap = state.cap;
-
-        if self.enabled() {
-            for idx in 0..self.num_enabled_vectors() {
-                let config = MsiIrqSourceConfig {
-                    high_addr: self.cap.msg_addr_hi,
-                    low_addr: self.cap.msg_addr_lo,
-                    data: self.cap.msg_data as u32,
-                    devid: 0,
-                };
-
-                self.interrupt_source_group
-                    .update(
-                        idx as InterruptIndex,
-                        InterruptSourceConfig::MsiIrq(config),
-                        self.cap.vector_masked(idx),
-                    )
-                    .map_err(Error::UpdateInterruptRoute)?;
-            }
-
-            self.interrupt_source_group
-                .enable()
-                .map_err(Error::EnableInterruptRoute)?;
-        }
-
-        Ok(())
     }
 
     pub fn enabled(&self) -> bool {
@@ -281,21 +284,10 @@ impl Pausable for MsiConfig {}
 
 impl Snapshottable for MsiConfig {
     fn id(&self) -> String {
-        String::from("msi_config")
+        String::from(MSI_CONFIG_ID)
     }
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
-        Snapshot::new_from_versioned_state(&self.id(), &self.state())
-    }
-
-    fn restore(&mut self, snapshot: Snapshot) -> std::result::Result<(), MigratableError> {
-        self.set_state(&snapshot.to_versioned_state(&self.id())?)
-            .map_err(|e| {
-                MigratableError::Restore(anyhow!(
-                    "Could not restore state for {}: {:?}",
-                    self.id(),
-                    e
-                ))
-            })
+        Snapshot::new_from_versioned_state(&self.state())
     }
 }

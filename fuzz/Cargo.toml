@@ -12,18 +12,20 @@ cargo-fuzz = true
 block_util = { path = "../block_util" }
 devices = { path = "../devices" }
 epoll = "4.3.1"
-libc = "0.2.135"
+libc = "0.2.138"
 libfuzzer-sys = "0.4.5"
+linux-loader = { version = "0.8.1", features = ["elf", "bzimage", "pe"] }
 micro_http = { git = "https://github.com/firecracker-microvm/micro-http", branch = "main" }
-once_cell = "1.16.0"
+net_util = { path = "../net_util" }
+once_cell = "1.17.0"
 qcow = { path = "../qcow" }
 seccompiler = "0.3.0"
 vhdx = { path = "../vhdx" }
 virtio-devices = { path = "../virtio-devices" }
-virtio-queue = "0.6.1"
+virtio-queue = "0.7.0"
 vmm = { path = "../vmm" }
-vmm-sys-util = "0.10.0"
-vm-memory = "0.9.0"
+vmm-sys-util = "0.11.1"
+vm-memory = "0.10.0"
 vm-device = { path = "../vm-device" }
 vm-virtio = { path = "../vm-virtio" }
 
@@ -31,10 +33,8 @@ vm-virtio = { path = "../vm-virtio" }
 path = ".."
 
 [patch.crates-io]
-kvm-bindings = { git = "https://github.com/cloud-hypervisor/kvm-bindings", branch = "ch-v0.5.0-tdx" }
-kvm-ioctls = { git = "https://github.com/rust-vmm/kvm-ioctls", branch = "main" }
+kvm-bindings = { git = "https://github.com/cloud-hypervisor/kvm-bindings", branch = "ch-v0.6.0-tdx" }
 versionize_derive = { git = "https://github.com/cloud-hypervisor/versionize_derive", branch = "ch" }
-vhost = { git = "https://github.com/rust-vmm/vhost", branch = "main" }
 
 # Prevent this from interfering with workspaces
 [workspace]
@@ -77,8 +77,26 @@ test = false
 doc = false
 
 [[bin]]
+name = "linux_loader"
+path = "fuzz_targets/linux_loader.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "linux_loader_cmdline"
+path = "fuzz_targets/linux_loader_cmdline.rs"
+test = false
+doc = false
+
+[[bin]]
 name = "mem"
 path = "fuzz_targets/mem.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "net"
+path = "fuzz_targets/net.rs"
 test = false
 doc = false
 

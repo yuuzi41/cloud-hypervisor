@@ -22,8 +22,10 @@ pub mod vhdx_sync;
 
 use crate::async_io::{AsyncIo, AsyncIoError, AsyncIoResult};
 use io_uring::{opcode, IoUring, Probe};
+use smallvec::SmallVec;
 use std::alloc::{alloc_zeroed, dealloc, Layout};
 use std::cmp;
+use std::collections::VecDeque;
 use std::convert::TryInto;
 use std::fs::File;
 use std::io::{self, IoSlice, IoSliceMut, Read, Seek, SeekFrom, Write};
@@ -32,6 +34,7 @@ use std::path::Path;
 use std::result;
 use std::sync::Arc;
 use std::sync::MutexGuard;
+use std::time::Instant;
 use thiserror::Error;
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
@@ -195,10 +198,11 @@ pub struct AlignedOperation {
 pub struct Request {
     pub request_type: RequestType,
     pub sector: u64,
-    pub data_descriptors: Vec<(GuestAddress, u32)>,
+    pub data_descriptors: SmallVec<[(GuestAddress, u32); 1]>,
     pub status_addr: GuestAddress,
     pub writeback: bool,
     pub aligned_operations: Vec<AlignedOperation>,
+    pub start: Instant,
 }
 
 impl Request {
@@ -226,10 +230,11 @@ impl Request {
         let mut req = Request {
             request_type: request_type(desc_chain.memory(), hdr_desc_addr)?,
             sector: sector(desc_chain.memory(), hdr_desc_addr)?,
-            data_descriptors: Vec::new(),
+            data_descriptors: SmallVec::with_capacity(1),
             status_addr: GuestAddress(0),
             writeback: true,
             aligned_operations: Vec::new(),
+            start: Instant::now(),
         };
 
         let status_desc;
@@ -249,6 +254,7 @@ impl Request {
                 return Err(Error::DescriptorChainTooShort);
             }
         } else {
+            req.data_descriptors.reserve_exact(1);
             while desc.has_next() {
                 if desc.is_write_only() && req.request_type == RequestType::Out {
                     return Err(Error::UnexpectedWriteOnlyDescriptor);
@@ -353,7 +359,8 @@ impl Request {
         let request_type = self.request_type;
         let offset = (sector << SECTOR_SHIFT) as libc::off_t;
 
-        let mut iovecs = Vec::new();
+        let mut iovecs: SmallVec<[libc::iovec; 1]> =
+            SmallVec::with_capacity(self.data_descriptors.len());
         for (data_addr, data_len) in &self.data_descriptors {
             if *data_len == 0 {
                 continue;
@@ -430,12 +437,12 @@ impl Request {
                         .mark_dirty(0, *data_len as usize);
                 }
                 disk_image
-                    .read_vectored(offset, iovecs, user_data)
+                    .read_vectored(offset, &iovecs, user_data)
                     .map_err(ExecuteError::AsyncRead)?;
             }
             RequestType::Out => {
                 disk_image
-                    .write_vectored(offset, iovecs, user_data)
+                    .write_vectored(offset, &iovecs, user_data)
                     .map_err(ExecuteError::AsyncWrite)?;
             }
             RequestType::Flush => {
@@ -589,10 +596,10 @@ where
     fn read_vectored_sync(
         &mut self,
         offset: libc::off_t,
-        iovecs: Vec<libc::iovec>,
+        iovecs: &[libc::iovec],
         user_data: u64,
         eventfd: &EventFd,
-        completion_list: &mut Vec<(u64, i32)>,
+        completion_list: &mut VecDeque<(u64, i32)>,
     ) -> AsyncIoResult<()> {
         // Convert libc::iovec into IoSliceMut
         let mut slices = Vec::new();
@@ -613,7 +620,7 @@ where
                 .map_err(AsyncIoError::ReadVectored)?
         };
 
-        completion_list.push((user_data, result as i32));
+        completion_list.push_back((user_data, result as i32));
         eventfd.write(1).unwrap();
 
         Ok(())
@@ -622,10 +629,10 @@ where
     fn write_vectored_sync(
         &mut self,
         offset: libc::off_t,
-        iovecs: Vec<libc::iovec>,
+        iovecs: &[libc::iovec],
         user_data: u64,
         eventfd: &EventFd,
-        completion_list: &mut Vec<(u64, i32)>,
+        completion_list: &mut VecDeque<(u64, i32)>,
     ) -> AsyncIoResult<()> {
         // Convert libc::iovec into IoSlice
         let mut slices = Vec::new();
@@ -646,7 +653,7 @@ where
                 .map_err(AsyncIoError::WriteVectored)?
         };
 
-        completion_list.push((user_data, result as i32));
+        completion_list.push_back((user_data, result as i32));
         eventfd.write(1).unwrap();
 
         Ok(())
@@ -656,7 +663,7 @@ where
         &mut self,
         user_data: Option<u64>,
         eventfd: &EventFd,
-        completion_list: &mut Vec<(u64, i32)>,
+        completion_list: &mut VecDeque<(u64, i32)>,
     ) -> AsyncIoResult<()> {
         let result: i32 = {
             let mut file = self.file();
@@ -668,7 +675,7 @@ where
         };
 
         if let Some(user_data) = user_data {
-            completion_list.push((user_data, result));
+            completion_list.push_back((user_data, result));
             eventfd.write(1).unwrap();
         }
 

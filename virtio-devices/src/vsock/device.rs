@@ -348,16 +348,16 @@ where
         exit_evt: EventFd,
         state: Option<VsockState>,
     ) -> io::Result<Vsock<B>> {
-        let (avail_features, acked_features) = if let Some(state) = state {
+        let (avail_features, acked_features, paused) = if let Some(state) = state {
             info!("Restoring virtio-vsock {}", id);
-            (state.avail_features, state.acked_features)
+            (state.avail_features, state.acked_features, true)
         } else {
             let mut avail_features = 1u64 << VIRTIO_F_VERSION_1 | 1u64 << VIRTIO_F_IN_ORDER;
 
             if iommu {
                 avail_features |= 1u64 << VIRTIO_F_IOMMU_PLATFORM;
             }
-            (avail_features, 0)
+            (avail_features, 0, false)
         };
 
         Ok(Vsock {
@@ -368,6 +368,7 @@ where
                 paused_sync: Some(Arc::new(Barrier::new(2))),
                 queue_sizes: QUEUE_SIZES.to_vec(),
                 min_queues: NUM_QUEUES as u16,
+                paused: Arc::new(AtomicBool::new(paused)),
                 ..Default::default()
             },
             id,
@@ -396,6 +397,7 @@ where
             // Ignore the result because there is nothing we can do about it.
             let _ = kill_evt.write(1);
         }
+        self.common.wait_for_epoll_threads();
     }
 }
 
@@ -517,7 +519,7 @@ where
     }
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
-        Snapshot::new_from_versioned_state(&self.id, &self.state())
+        Snapshot::new_from_versioned_state(&self.state())
     }
 }
 impl<B> Transportable for Vsock<B> where B: VsockBackend + Sync + 'static {}
@@ -597,7 +599,7 @@ mod tests {
                 .activate(memory.clone(), Arc::new(NoopVirtioInterrupt {}), Vec::new());
         match bad_activate {
             Err(ActivateError::BadActivate) => (),
-            other => panic!("{:?}", other),
+            other => panic!("{other:?}"),
         }
 
         // Test a correct activation.

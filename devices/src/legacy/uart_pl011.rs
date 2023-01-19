@@ -60,11 +60,11 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Error::BadWriteOffset(offset) => write!(f, "pl011_write: Bad Write Offset: {}", offset),
+            Error::BadWriteOffset(offset) => write!(f, "pl011_write: Bad Write Offset: {offset}"),
             Error::DmaNotImplemented => write!(f, "pl011: DMA not implemented."),
-            Error::InterruptFailure(e) => write!(f, "Failed to trigger interrupt: {}", e),
-            Error::WriteAllFailure(e) => write!(f, "Failed to write: {}", e),
-            Error::FlushFailure(e) => write!(f, "Failed to flush: {}", e),
+            Error::InterruptFailure(e) => write!(f, "Failed to trigger interrupt: {e}"),
+            Error::WriteAllFailure(e) => write!(f, "Failed to write: {e}"),
+            Error::FlushFailure(e) => write!(f, "Failed to flush: {e}"),
         }
     }
 }
@@ -454,7 +454,7 @@ impl Snapshottable for Pl011 {
     }
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
-        Snapshot::new_from_versioned_state(&self.id, &self.state())
+        Snapshot::new_from_versioned_state(&self.state())
     }
 }
 
@@ -533,10 +533,10 @@ mod tests {
             None,
         );
 
-        pl011.write(0, UARTDR as u64, &[b'x', b'y']);
-        pl011.write(0, UARTDR as u64, &[b'a']);
-        pl011.write(0, UARTDR as u64, &[b'b']);
-        pl011.write(0, UARTDR as u64, &[b'c']);
+        pl011.write(0, UARTDR, &[b'x', b'y']);
+        pl011.write(0, UARTDR, &[b'a']);
+        pl011.write(0, UARTDR, &[b'b']);
+        pl011.write(0, UARTDR, &[b'c']);
         assert_eq!(
             pl011_out.buf.lock().unwrap().as_slice(),
             &[b'x', b'a', b'b', b'c']
@@ -563,11 +563,11 @@ mod tests {
         assert_eq!(intr_evt.read().unwrap(), 2);
 
         let mut data = [0u8];
-        pl011.read(0, UARTDR as u64, &mut data);
+        pl011.read(0, UARTDR, &mut data);
         assert_eq!(data[0], b'a');
-        pl011.read(0, UARTDR as u64, &mut data);
+        pl011.read(0, UARTDR, &mut data);
         assert_eq!(data[0], b'b');
-        pl011.read(0, UARTDR as u64, &mut data);
+        pl011.read(0, UARTDR, &mut data);
         assert_eq!(data[0], b'c');
     }
 }

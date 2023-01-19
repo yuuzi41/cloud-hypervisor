@@ -51,13 +51,13 @@ pub enum Error {
 impl fmt::Display for Error {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Error::BadWriteOffset(offset) => write!(f, "Bad Write Offset: {}", offset),
+            Error::BadWriteOffset(offset) => write!(f, "Bad Write Offset: {offset}"),
             Error::GpioInterruptDisabled => write!(f, "GPIO interrupt disabled by guest driver.",),
             Error::GpioInterruptFailure(ref e) => {
-                write!(f, "Could not trigger GPIO interrupt: {}.", e)
+                write!(f, "Could not trigger GPIO interrupt: {e}.")
             }
             Error::GpioTriggerKeyFailure(key) => {
-                write!(f, "Invalid GPIO Input key triggerd: {}.", key)
+                write!(f, "Invalid GPIO Input key triggerd: {key}.")
             }
         }
     }
@@ -162,7 +162,7 @@ impl Gpio {
         //  Missing Output Interrupt Emulation.
 
         // Input Edging Interrupt Emulation.
-        let changed = ((self.old_in_data ^ self.data) & !self.dir) as u32;
+        let changed = (self.old_in_data ^ self.data) & !self.dir;
         if changed > 0 {
             self.old_in_data = self.data;
             for i in 0..N_GPIOS {
@@ -328,7 +328,7 @@ impl Snapshottable for Gpio {
     }
 
     fn snapshot(&mut self) -> std::result::Result<Snapshot, MigratableError> {
-        Snapshot::new_from_versioned_state(&self.id, &self.state())
+        Snapshot::new_from_versioned_state(&self.state())
     }
 }
 

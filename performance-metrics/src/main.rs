@@ -5,16 +5,14 @@
 
 // Custom harness to run performance tests
 extern crate test_infra;
-#[macro_use(crate_authors)]
-extern crate clap;
 
 mod performance_tests;
 
-use clap::{Arg, ArgAction, Command as ClapCommand};
+use argh::FromArgs;
 use performance_tests::*;
 use serde::{Deserialize, Serialize};
 use std::{
-    env, fmt,
+    fmt,
     process::Command,
     sync::{mpsc::channel, Arc},
     thread,
@@ -117,7 +115,7 @@ pub struct PerformanceTestOverrides {
 impl fmt::Display for PerformanceTestOverrides {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         if let Some(test_iterations) = self.test_iterations {
-            write!(f, "test_iterations = {}", test_iterations)?;
+            write!(f, "test_iterations = {test_iterations}")?;
         }
 
         Ok(())
@@ -129,8 +127,8 @@ pub struct PerformanceTestControl {
     test_iterations: u32,
     num_queues: Option<u32>,
     queue_size: Option<u32>,
-    net_rx: Option<bool>,
-    fio_ops: Option<FioOps>,
+    net_control: Option<(bool, bool)>, // First bool is for RX(true)/TX(false), second bool is for bandwidth or PPS
+    fio_control: Option<(FioOps, bool)>, // Second parameter controls whether we want bandwidth or IOPS
     num_boot_vcpus: Option<u8>,
 }
 
@@ -141,19 +139,21 @@ impl fmt::Display for PerformanceTestControl {
             self.test_timeout, self.test_iterations
         );
         if let Some(o) = self.num_queues {
-            output = format!("{}, num_queues = {}", output, o);
+            output = format!("{output}, num_queues = {o}");
         }
         if let Some(o) = self.queue_size {
-            output = format!("{}, queue_size = {}", output, o);
+            output = format!("{output}, queue_size = {o}");
         }
-        if let Some(o) = self.net_rx {
-            output = format!("{}, net_rx = {}", output, o);
+        if let Some(o) = self.net_control {
+            let (rx, bw) = o;
+            output = format!("{output}, rx = {rx}, bandwidth = {bw}");
         }
-        if let Some(o) = &self.fio_ops {
-            output = format!("{}, fio_ops = {}", output, o);
+        if let Some(o) = &self.fio_control {
+            let (ops, bw) = o;
+            output = format!("{output}, fio_ops = {ops}, bandwidth = {bw}");
         }
 
-        write!(f, "{}", output)
+        write!(f, "{output}")
     }
 }
 
@@ -164,8 +164,8 @@ impl PerformanceTestControl {
             test_iterations: 5,
             num_queues: None,
             queue_size: None,
-            net_rx: None,
-            fio_ops: None,
+            net_control: None,
+            fio_control: None,
             num_boot_vcpus: Some(1),
         }
     }
@@ -262,7 +262,7 @@ mod adjuster {
     }
 }
 
-const TEST_LIST: [PerformanceTest; 17] = [
+const TEST_LIST: [PerformanceTest; 29] = [
     PerformanceTest {
         name: "boot_time_ms",
         func_ptr: performance_boot_time,
@@ -321,7 +321,7 @@ const TEST_LIST: [PerformanceTest; 17] = [
         control: PerformanceTestControl {
             num_queues: Some(2),
             queue_size: Some(256),
-            net_rx: Some(true),
+            net_control: Some((true, true)),
             ..PerformanceTestControl::default()
         },
         unit_adjuster: adjuster::bps_to_gbps,
@@ -332,7 +332,7 @@ const TEST_LIST: [PerformanceTest; 17] = [
         control: PerformanceTestControl {
             num_queues: Some(2),
             queue_size: Some(256),
-            net_rx: Some(false),
+            net_control: Some((false, true)),
             ..PerformanceTestControl::default()
         },
         unit_adjuster: adjuster::bps_to_gbps,
@@ -343,7 +343,7 @@ const TEST_LIST: [PerformanceTest; 17] = [
         control: PerformanceTestControl {
             num_queues: Some(4),
             queue_size: Some(256),
-            net_rx: Some(true),
+            net_control: Some((true, true)),
             ..PerformanceTestControl::default()
         },
         unit_adjuster: adjuster::bps_to_gbps,
@@ -354,10 +354,54 @@ const TEST_LIST: [PerformanceTest; 17] = [
         control: PerformanceTestControl {
             num_queues: Some(4),
             queue_size: Some(256),
-            net_rx: Some(false),
+            net_control: Some((false, true)),
             ..PerformanceTestControl::default()
         },
         unit_adjuster: adjuster::bps_to_gbps,
+    },
+    PerformanceTest {
+        name: "virtio_net_throughput_single_queue_rx_pps",
+        func_ptr: performance_net_throughput,
+        control: PerformanceTestControl {
+            num_queues: Some(2),
+            queue_size: Some(256),
+            net_control: Some((true, false)),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::identity,
+    },
+    PerformanceTest {
+        name: "virtio_net_throughput_single_queue_tx_pps",
+        func_ptr: performance_net_throughput,
+        control: PerformanceTestControl {
+            num_queues: Some(2),
+            queue_size: Some(256),
+            net_control: Some((false, false)),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::identity,
+    },
+    PerformanceTest {
+        name: "virtio_net_throughput_multi_queue_rx_pps",
+        func_ptr: performance_net_throughput,
+        control: PerformanceTestControl {
+            num_queues: Some(4),
+            queue_size: Some(256),
+            net_control: Some((true, false)),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::identity,
+    },
+    PerformanceTest {
+        name: "virtio_net_throughput_multi_queue_tx_pps",
+        func_ptr: performance_net_throughput,
+        control: PerformanceTestControl {
+            num_queues: Some(4),
+            queue_size: Some(256),
+            net_control: Some((false, false)),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::identity,
     },
     PerformanceTest {
         name: "block_read_MiBps",
@@ -365,7 +409,7 @@ const TEST_LIST: [PerformanceTest; 17] = [
         control: PerformanceTestControl {
             num_queues: Some(1),
             queue_size: Some(128),
-            fio_ops: Some(FioOps::Read),
+            fio_control: Some((FioOps::Read, true)),
             ..PerformanceTestControl::default()
         },
         unit_adjuster: adjuster::Bps_to_MiBps,
@@ -376,7 +420,7 @@ const TEST_LIST: [PerformanceTest; 17] = [
         control: PerformanceTestControl {
             num_queues: Some(1),
             queue_size: Some(128),
-            fio_ops: Some(FioOps::Write),
+            fio_control: Some((FioOps::Write, true)),
             ..PerformanceTestControl::default()
         },
         unit_adjuster: adjuster::Bps_to_MiBps,
@@ -387,7 +431,7 @@ const TEST_LIST: [PerformanceTest; 17] = [
         control: PerformanceTestControl {
             num_queues: Some(1),
             queue_size: Some(128),
-            fio_ops: Some(FioOps::RandomRead),
+            fio_control: Some((FioOps::RandomRead, true)),
             ..PerformanceTestControl::default()
         },
         unit_adjuster: adjuster::Bps_to_MiBps,
@@ -398,7 +442,7 @@ const TEST_LIST: [PerformanceTest; 17] = [
         control: PerformanceTestControl {
             num_queues: Some(1),
             queue_size: Some(128),
-            fio_ops: Some(FioOps::RandomWrite),
+            fio_control: Some((FioOps::RandomWrite, true)),
             ..PerformanceTestControl::default()
         },
         unit_adjuster: adjuster::Bps_to_MiBps,
@@ -409,7 +453,7 @@ const TEST_LIST: [PerformanceTest; 17] = [
         control: PerformanceTestControl {
             num_queues: Some(2),
             queue_size: Some(128),
-            fio_ops: Some(FioOps::Read),
+            fio_control: Some((FioOps::Read, true)),
             ..PerformanceTestControl::default()
         },
         unit_adjuster: adjuster::Bps_to_MiBps,
@@ -420,7 +464,7 @@ const TEST_LIST: [PerformanceTest; 17] = [
         control: PerformanceTestControl {
             num_queues: Some(2),
             queue_size: Some(128),
-            fio_ops: Some(FioOps::Write),
+            fio_control: Some((FioOps::Write, true)),
             ..PerformanceTestControl::default()
         },
         unit_adjuster: adjuster::Bps_to_MiBps,
@@ -431,7 +475,7 @@ const TEST_LIST: [PerformanceTest; 17] = [
         control: PerformanceTestControl {
             num_queues: Some(2),
             queue_size: Some(128),
-            fio_ops: Some(FioOps::RandomRead),
+            fio_control: Some((FioOps::RandomRead, true)),
             ..PerformanceTestControl::default()
         },
         unit_adjuster: adjuster::Bps_to_MiBps,
@@ -442,10 +486,98 @@ const TEST_LIST: [PerformanceTest; 17] = [
         control: PerformanceTestControl {
             num_queues: Some(2),
             queue_size: Some(128),
-            fio_ops: Some(FioOps::RandomWrite),
+            fio_control: Some((FioOps::RandomWrite, true)),
             ..PerformanceTestControl::default()
         },
         unit_adjuster: adjuster::Bps_to_MiBps,
+    },
+    PerformanceTest {
+        name: "block_read_IOPS",
+        func_ptr: performance_block_io,
+        control: PerformanceTestControl {
+            num_queues: Some(1),
+            queue_size: Some(128),
+            fio_control: Some((FioOps::Read, false)),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::identity,
+    },
+    PerformanceTest {
+        name: "block_write_IOPS",
+        func_ptr: performance_block_io,
+        control: PerformanceTestControl {
+            num_queues: Some(1),
+            queue_size: Some(128),
+            fio_control: Some((FioOps::Write, false)),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::identity,
+    },
+    PerformanceTest {
+        name: "block_random_read_IOPS",
+        func_ptr: performance_block_io,
+        control: PerformanceTestControl {
+            num_queues: Some(1),
+            queue_size: Some(128),
+            fio_control: Some((FioOps::RandomRead, false)),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::identity,
+    },
+    PerformanceTest {
+        name: "block_random_write_IOPS",
+        func_ptr: performance_block_io,
+        control: PerformanceTestControl {
+            num_queues: Some(1),
+            queue_size: Some(128),
+            fio_control: Some((FioOps::RandomWrite, false)),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::identity,
+    },
+    PerformanceTest {
+        name: "block_multi_queue_read_IOPS",
+        func_ptr: performance_block_io,
+        control: PerformanceTestControl {
+            num_queues: Some(2),
+            queue_size: Some(128),
+            fio_control: Some((FioOps::Read, false)),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::identity,
+    },
+    PerformanceTest {
+        name: "block_multi_queue_write_IOPS",
+        func_ptr: performance_block_io,
+        control: PerformanceTestControl {
+            num_queues: Some(2),
+            queue_size: Some(128),
+            fio_control: Some((FioOps::Write, false)),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::identity,
+    },
+    PerformanceTest {
+        name: "block_multi_queue_random_read_IOPS",
+        func_ptr: performance_block_io,
+        control: PerformanceTestControl {
+            num_queues: Some(2),
+            queue_size: Some(128),
+            fio_control: Some((FioOps::RandomRead, false)),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::identity,
+    },
+    PerformanceTest {
+        name: "block_multi_queue_random_write_IOPS",
+        func_ptr: performance_block_io,
+        control: PerformanceTestControl {
+            num_queues: Some(2),
+            queue_size: Some(128),
+            fio_control: Some((FioOps::RandomWrite, false)),
+            ..PerformanceTestControl::default()
+        },
+        unit_adjuster: adjuster::identity,
     },
 ];
 
@@ -494,39 +626,37 @@ fn date() -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+#[derive(FromArgs)]
+/// Generate the performance metrics data for Cloud Hypervisor
+struct Options {
+    #[argh(switch, long = "list-tests")]
+    /// print the list of available metrics tests
+    list_tests: bool,
+
+    #[argh(option, long = "test-filter")]
+    /// filter metrics tests to run based on provided keywords
+    keywords: Vec<String>,
+
+    #[argh(option, long = "report-file")]
+    /// report file. Stderr is used if not specified
+    report_file: Option<String>,
+
+    #[argh(option, long = "iterations")]
+    /// override number of test iterations
+    iterations: Option<u32>,
+
+    #[argh(switch, short = 'V', long = "version")]
+    /// print version information
+    version: bool,
+}
+
 fn main() {
-    let cmd_arguments = ClapCommand::new("performance-metrics")
-        .version(env!("GIT_HUMAN_READABLE"))
-        .author(crate_authors!())
-        .about("Generate the performance metrics data for Cloud Hypervisor")
-        .arg(
-            Arg::new("test-filter")
-                .long("test-filter")
-                .help("Filter metrics tests to run based on provided keywords")
-                .num_args(1)
-                .required(false),
-        )
-        .arg(
-            Arg::new("list-tests")
-                .long("list-tests")
-                .help("Print the list of availale metrics tests")
-                .num_args(0)
-                .action(ArgAction::SetTrue)
-                .required(false),
-        )
-        .arg(
-            Arg::new("report-file")
-                .long("report-file")
-                .help("Report file. Standard error is used if not specified")
-                .num_args(1),
-        )
-        .arg(
-            Arg::new("iterations")
-                .long("iterations")
-                .help("Override number of test iterations")
-                .num_args(1),
-        )
-        .get_matches();
+    let opts: Options = argh::from_env();
+
+    if opts.version {
+        println!("{} {}", env!("CARGO_BIN_NAME"), env!("GIT_HUMAN_READABLE"));
+        return;
+    }
 
     // It seems that the tool (ethr) used for testing the virtio-net latency
     // is not stable on AArch64, and therefore the latency test is currently
@@ -536,7 +666,7 @@ fn main() {
         .filter(|t| !(cfg!(target_arch = "aarch64") && t.name == "virtio_net_latency_us"))
         .collect();
 
-    if cmd_arguments.get_flag("list-tests") {
+    if opts.list_tests {
         for test in test_list.iter() {
             println!("\"{}\" ({})", test.name, test.control);
         }
@@ -544,10 +674,7 @@ fn main() {
         return;
     }
 
-    let test_filter = match cmd_arguments.get_many::<String>("test-filter") {
-        Some(s) => s.collect(),
-        None => Vec::new(),
-    };
+    let test_filter = opts.keywords.iter().collect::<Vec<&String>>();
 
     // Run performance tests sequentially and report results (in both readable/json format)
     let mut metrics_report: MetricsReport = Default::default();
@@ -555,11 +682,7 @@ fn main() {
     init_tests();
 
     let overrides = Arc::new(PerformanceTestOverrides {
-        test_iterations: cmd_arguments
-            .get_one::<String>("iterations")
-            .map(|s| s.parse())
-            .transpose()
-            .unwrap_or_default(),
+        test_iterations: opts.iterations,
     });
 
     for test in test_list.iter() {
@@ -569,7 +692,7 @@ fn main() {
                     metrics_report.results.push(r);
                 }
                 Err(e) => {
-                    eprintln!("Aborting test due to error: '{:?}'", e);
+                    eprintln!("Aborting test due to error: '{e:?}'");
                     std::process::exit(1);
                 }
             };
@@ -578,19 +701,18 @@ fn main() {
 
     cleanup_tests();
 
-    let mut report_file: Box<dyn std::io::Write + Send> =
-        if let Some(file) = cmd_arguments.get_one::<String>("report-file") {
-            Box::new(
-                std::fs::File::create(std::path::Path::new(file))
-                    .map_err(|e| {
-                        eprintln!("Error opening report file: {}: {}", file, e);
-                        std::process::exit(1);
-                    })
-                    .unwrap(),
-            )
-        } else {
-            Box::new(std::io::stdout())
-        };
+    let mut report_file: Box<dyn std::io::Write + Send> = if let Some(ref file) = opts.report_file {
+        Box::new(
+            std::fs::File::create(std::path::Path::new(file))
+                .map_err(|e| {
+                    eprintln!("Error opening report file: {file}: {e}");
+                    std::process::exit(1);
+                })
+                .unwrap(),
+        )
+    } else {
+        Box::new(std::io::stdout())
+    };
 
     report_file
         .write_all(
@@ -599,7 +721,7 @@ fn main() {
                 .as_bytes(),
         )
         .map_err(|e| {
-            eprintln!("Error writing report file: {}", e);
+            eprintln!("Error writing report file: {e}");
             std::process::exit(1);
         })
         .unwrap();

@@ -24,8 +24,8 @@ pub use {kvm_ioctls::Cap, kvm_ioctls::Kvm};
 // This macro gets the offset of a structure (i.e `str`) member (i.e `field`) without having
 // an instance of that structure.
 #[macro_export]
-macro_rules! offset__of {
-    ($str:ty, $($field:ident)+) => ({
+macro_rules! offset_of {
+    ($str:ty, $field:ident) => {{
         let tmp: std::mem::MaybeUninit<$str> = std::mem::MaybeUninit::uninit();
         let base = tmp.as_ptr();
 
@@ -34,14 +34,16 @@ macro_rules! offset__of {
         // SAFETY: The pointer is valid and aligned, just not initialised. Using `addr_of` ensures
         // that we don't actually read from `base` (which would be UB) nor create an intermediate
         // reference.
-        let member = unsafe { core::ptr::addr_of!((*base).$($field)*) } as *const u8;
+        let member = unsafe { core::ptr::addr_of!((*base).$field) } as *const u8;
 
         // Avoid warnings when nesting `unsafe` blocks.
         #[allow(unused_unsafe)]
         // SAFETY: The two pointers are within the same allocated object `tmp`. All requirements
         // from offset_from are upheld.
-        unsafe { member.offset_from(base as *const u8) as usize }
-    });
+        unsafe {
+            member.offset_from(base as *const u8) as usize
+        }
+    }};
 }
 
 // Following are macros that help with getting the ID of a aarch64 core register.
@@ -97,8 +99,7 @@ pub fn is_system_register(regid: u64) -> bool {
 
     assert!(
         !(size != KVM_REG_SIZE_U32 && size != KVM_REG_SIZE_U64),
-        "Unexpected register size for system register {}",
-        size
+        "Unexpected register size for system register {size}"
     );
 
     true
