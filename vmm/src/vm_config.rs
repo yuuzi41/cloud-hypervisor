@@ -127,16 +127,11 @@ pub struct MemoryZoneConfig {
     pub prefault: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub enum HotplugMethod {
+    #[default]
     Acpi,
     VirtioMem,
-}
-
-impl Default for HotplugMethod {
-    fn default() -> Self {
-        HotplugMethod::Acpi
-    }
 }
 
 fn default_memoryconfig_thp() -> bool {
@@ -188,16 +183,11 @@ impl Default for MemoryConfig {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub enum VhostMode {
+    #[default]
     Client,
     Server,
-}
-
-impl Default for VhostMode {
-    fn default() -> Self {
-        VhostMode::Client
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -573,7 +563,7 @@ pub struct TpmConfig {
     pub socket: PathBuf,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct VmConfig {
     #[serde(default)]
     pub cpus: CpusConfig,
@@ -606,4 +596,10 @@ pub struct VmConfig {
     pub gdb: bool,
     pub platform: Option<PlatformConfig>,
     pub tpm: Option<TpmConfig>,
+    // Preseved FDs are the ones that share the same life-time as its holding
+    // VmConfig instance, such as FDs for creating TAP devices.
+    // Perserved FDs will stay open as long as the holding VmConfig instance is
+    // valid, and will be closed when the holding VmConfig instance is destroyed.
+    #[serde(skip)]
+    pub preserved_fds: Option<Vec<i32>>,
 }

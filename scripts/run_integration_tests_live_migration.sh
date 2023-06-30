@@ -46,7 +46,7 @@ fi
 popd
 
 # Download Cloud Hypervisor binary from its last stable release
-LAST_RELEASE_VERSION="v26.0"
+LAST_RELEASE_VERSION="v30.0"
 CH_RELEASE_URL="https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/$LAST_RELEASE_VERSION/cloud-hypervisor-static"
 CH_RELEASE_NAME="cloud-hypervisor-static"
 pushd $WORKLOADS_DIR
@@ -56,26 +56,8 @@ popd
 
 # Build custom kernel based on virtio-pmem and virtio-fs upstream patches
 VMLINUX_IMAGE="$WORKLOADS_DIR/vmlinux"
-
-LINUX_CUSTOM_DIR="$WORKLOADS_DIR/linux-custom"
-
 if [ ! -f "$VMLINUX_IMAGE" ]; then
-    SRCDIR=$PWD
-    pushd $WORKLOADS_DIR
-    time git clone --depth 1 "https://github.com/cloud-hypervisor/linux.git" -b "ch-5.15.12" $LINUX_CUSTOM_DIR
-    cp $SRCDIR/resources/linux-config-x86_64 $LINUX_CUSTOM_DIR/.config
-    popd
-fi
-
-if [ ! -f "$VMLINUX_IMAGE" ]; then
-    pushd $LINUX_CUSTOM_DIR
-    time make bzImage -j `nproc`
-    cp vmlinux $VMLINUX_IMAGE || exit 1
-    popd
-fi
-
-if [ -d "$LINUX_CUSTOM_DIR" ]; then
-    rm -rf $LINUX_CUSTOM_DIR
+    build_custom_linux
 fi
 
 BUILD_TARGET="$(uname -m)-unknown-linux-${CH_LIBC}"
@@ -89,7 +71,9 @@ fi
 cargo build --no-default-features --features "kvm,mshv" --all --release --target $BUILD_TARGET
 
 # Test ovs-dpdk relies on hugepages
-echo 6144 | sudo tee /proc/sys/vm/nr_hugepages
+HUGEPAGESIZE=`grep Hugepagesize /proc/meminfo | awk '{print $2}'`
+PAGE_NUM=`echo $((12288 * 1024 / $HUGEPAGESIZE))`
+echo $PAGE_NUM | sudo tee /proc/sys/vm/nr_hugepages
 sudo chmod a+rwX /dev/hugepages
 
 export RUST_BACKTRACE=1

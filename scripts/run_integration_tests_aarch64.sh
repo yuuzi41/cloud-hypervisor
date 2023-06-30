@@ -148,7 +148,7 @@ update_workloads() {
     popd
 
     # Download Cloud Hypervisor binary from its last stable release
-    LAST_RELEASE_VERSION="v26.0"
+    LAST_RELEASE_VERSION="v30.0"
     CH_RELEASE_URL="https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/$LAST_RELEASE_VERSION/cloud-hypervisor-static-aarch64"
     CH_RELEASE_NAME="cloud-hypervisor-static-aarch64"
     pushd $WORKLOADS_DIR
@@ -225,8 +225,8 @@ fi
 
 BUILD_TARGET="aarch64-unknown-linux-${CH_LIBC}"
 if [[ "${BUILD_TARGET}" == "aarch64-unknown-linux-musl" ]]; then
-export TARGET_CC="musl-gcc"
-export RUSTFLAGS="-C link-arg=-lgcc -C link_arg=-specs -C link_arg=/usr/lib/aarch64-linux-musl/musl-gcc.specs"
+    export TARGET_CC="musl-gcc"
+    export RUSTFLAGS="-C link-arg=-lgcc -C link_arg=-specs -C link_arg=/usr/lib/aarch64-linux-musl/musl-gcc.specs"
 fi
 
 export RUST_BACKTRACE=1
@@ -240,7 +240,9 @@ sudo bash -c "echo 10 > /sys/kernel/mm/ksm/sleep_millisecs"
 sudo bash -c "echo 1 > /sys/kernel/mm/ksm/run"
 
 # Both test_vfio and ovs-dpdk rely on hugepages
-echo 6144 | sudo tee /proc/sys/vm/nr_hugepages
+HUGEPAGESIZE=`grep Hugepagesize /proc/meminfo | awk '{print $2}'`
+PAGE_NUM=`echo $((12288 * 1024 / $HUGEPAGESIZE))`
+echo $PAGE_NUM | sudo tee /proc/sys/vm/nr_hugepages
 sudo chmod a+rwX /dev/hugepages
 
 # Run all direct kernel boot (Device Tree) test cases in mod `parallel`
@@ -277,6 +279,14 @@ if [ $RES -eq 0 ]; then
     RES=$?
 else
     exit $RES
+fi
+
+# Run tests on dbus_api
+if [ $RES -eq 0 ]; then
+    cargo build --features "dbus_api" --all --release --target $BUILD_TARGET
+    export RUST_BACKTRACE=1
+    time cargo test "dbus_api::$test_filter" --target $BUILD_TARGET -- ${test_binary_args[*]}
+    RES=$?
 fi
 
 exit $RES

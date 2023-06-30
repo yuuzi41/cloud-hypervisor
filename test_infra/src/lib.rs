@@ -249,7 +249,8 @@ impl DiskConfig for UbuntuDiskConfig {
             .unwrap()
             .join("test_data")
             .join("cloud-init")
-            .join("ubuntu");
+            .join("ubuntu")
+            .join("ci");
 
         vec!["meta-data"].iter().for_each(|x| {
             rate_limited_copy(source_file_dir.join(x), cloud_init_directory.join(x))
@@ -301,7 +302,7 @@ impl DiskConfig for UbuntuDiskConfig {
             .expect("Expected writing out network-config to succeed");
 
         std::process::Command::new("mkdosfs")
-            .args(["-n", "cidata"])
+            .args(["-n", "CIDATA"])
             .args(["-C", cloudinit_file_path.as_str()])
             .arg("8192")
             .output()
@@ -868,14 +869,6 @@ impl Guest {
             .map_err(Error::Parsing)
     }
 
-    #[cfg(target_arch = "x86_64")]
-    pub fn get_initial_apicid(&self) -> Result<u32, Error> {
-        self.ssh_command("grep \"initial apicid\" /proc/cpuinfo | grep -o \"[0-9]*\"")?
-            .trim()
-            .parse()
-            .map_err(Error::Parsing)
-    }
-
     pub fn get_total_memory(&self) -> Result<u32, Error> {
         self.ssh_command("grep MemTotal /proc/meminfo | grep -o \"[0-9]*\"")?
             .trim()
@@ -1352,6 +1345,7 @@ pub fn parse_iperf3_output(output: &[u8], sender: bool, bandwidth: bool) -> Resu
     })
 }
 
+#[derive(Clone)]
 pub enum FioOps {
     Read,
     RandomRead,

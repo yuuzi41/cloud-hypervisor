@@ -36,12 +36,21 @@ impl EndpointHandler for VmCreate {
                 match &req.body {
                     Some(body) => {
                         // Deserialize into a VmConfig
-                        let vm_config: VmConfig = match serde_json::from_slice(body.raw())
+                        let mut vm_config: VmConfig = match serde_json::from_slice(body.raw())
                             .map_err(HttpError::SerdeJsonDeserialize)
                         {
                             Ok(config) => config,
                             Err(e) => return error_response(e, StatusCode::BadRequest),
                         };
+
+                        if let Some(ref mut nets) = vm_config.net {
+                            if nets.iter().any(|net| net.fds.is_some()) {
+                                warn!("Ignoring FDs sent via the HTTP request body");
+                            }
+                            for net in nets {
+                                net.fds = None;
+                            }
+                        }
 
                         // Call vm_create()
                         match vm_create(api_notifier, api_sender, Arc::new(Mutex::new(vm_config)))
@@ -105,6 +114,10 @@ impl EndpointHandler for VmActionHandler {
                 ),
                 AddNet(_) => {
                     let mut net_cfg: NetConfig = serde_json::from_slice(body.raw())?;
+                    if net_cfg.fds.is_some() {
+                        warn!("Ignoring FDs sent via the HTTP request body");
+                        net_cfg.fds = None;
+                    }
                     // Update network config with optional files that might have
                     // been sent through control message.
                     if !files.is_empty() {

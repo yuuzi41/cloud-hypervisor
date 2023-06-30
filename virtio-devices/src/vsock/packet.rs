@@ -2,19 +2,19 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-/// `VsockPacket` provides a thin wrapper over the buffers exchanged via virtio queues.
-/// There are two components to a vsock packet, each using its own descriptor in a
-/// virtio queue:
-/// - the packet header; and
-/// - the packet data/buffer.
-/// There is a 1:1 relation between descriptor chains and packets: the first (chain head) holds
-/// the header, and an optional second descriptor holds the data. The second descriptor is only
-/// present for data packets (VSOCK_OP_RW).
-///
-/// `VsockPacket` wraps these two buffers and provides direct access to the data stored
-/// in guest memory. This is done to avoid unnecessarily copying data from guest memory
-/// to temporary buffers, before passing it on to the vsock backend.
-///
+//! `VsockPacket` provides a thin wrapper over the buffers exchanged via virtio queues.
+//! There are two components to a vsock packet, each using its own descriptor in a
+//! virtio queue:
+//! - the packet header; and
+//! - the packet data/buffer.
+//! There is a 1:1 relation between descriptor chains and packets: the first (chain head) holds
+//! the header, and an optional second descriptor holds the data. The second descriptor is only
+//! present for data packets (VSOCK_OP_RW).
+//!
+//! `VsockPacket` wraps these two buffers and provides direct access to the data stored
+//! in guest memory. This is done to avoid unnecessarily copying data from guest memory
+//! to temporary buffers, before passing it on to the vsock backend.
+
 use byteorder::{ByteOrder, LittleEndian};
 use std::ops::Deref;
 use std::sync::Arc;
@@ -43,12 +43,12 @@ use vm_virtio::{AccessPlatform, Translatable};
 // };
 // ```
 //
-// This structed will occupy the buffer pointed to by the head descriptor. We'll be accessing it
+// This struct will occupy the buffer pointed to by the head descriptor. We'll be accessing it
 // as a byte slice. To that end, we define below the offsets for each field struct, as well as the
 // packed struct size, as a bunch of `usize` consts.
 // Note that these offsets are only used privately by the `VsockPacket` struct, the public interface
 // consisting of getter and setter methods, for each struct field, that will also handle the correct
-// endianess.
+// endianness.
 
 /// The vsock packet header struct size (when packed).
 pub const VSOCK_PKT_HDR_SIZE: usize = 44;
@@ -389,7 +389,7 @@ mod tests {
     use super::*;
     use crate::vsock::defs::MAX_PKT_BUF_SIZE;
     use crate::GuestMemoryMmap;
-    use virtio_bindings::bindings::virtio_ring::VRING_DESC_F_WRITE;
+    use virtio_bindings::virtio_ring::VRING_DESC_F_WRITE;
     use virtio_queue::QueueOwnedT;
     use vm_memory::GuestAddress;
     use vm_virtio::queue::testing::VirtqDesc as GuestQDesc;
@@ -436,7 +436,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::cognitive_complexity)]
     fn test_tx_packet_assembly() {
         // Test case: successful TX packet assembly.
         {
@@ -581,7 +580,6 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::cognitive_complexity)]
     fn test_packet_hdr_accessors() {
         const SRC_CID: u64 = 1;
         const DST_CID: u64 = 2;

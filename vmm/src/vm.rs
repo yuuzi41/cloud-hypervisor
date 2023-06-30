@@ -21,7 +21,7 @@ use crate::coredump::{
     CpuElf64Writable, DumpState, Elf64Writable, GuestDebuggable, GuestDebuggableError, NoteDescType,
 };
 use crate::cpu;
-use crate::device_manager::{Console, DeviceManager, DeviceManagerError, PtyPair};
+use crate::device_manager::{DeviceManager, DeviceManagerError, PtyPair};
 use crate::device_tree::DeviceTree;
 #[cfg(feature = "guest_debug")]
 use crate::gdb::{Debuggable, DebuggableError, GdbRequestPayload, GdbResponsePayload};
@@ -33,7 +33,6 @@ use crate::migration::get_vm_snapshot;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use crate::migration::url_to_file;
 use crate::migration::{url_to_path, SNAPSHOT_CONFIG_FILE, SNAPSHOT_STATE_FILE};
-use crate::seccomp_filters::{get_seccomp_filter, Thread};
 use crate::GuestMemoryMmap;
 use crate::{
     PciDeviceInfo, CPU_MANAGER_SNAPSHOT_ID, DEVICE_MANAGER_SNAPSHOT_ID, MEMORY_MANAGER_SNAPSHOT_ID,
@@ -56,6 +55,7 @@ use gdbstub_arch::aarch64::reg::AArch64CoreRegs as CoreRegs;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use gdbstub_arch::x86::reg::X86_64CoreRegs as CoreRegs;
 use hypervisor::{HypervisorVmError, VmOps};
+use libc::{termios, SIGWINCH};
 use linux_loader::cmdline::Cmdline;
 #[cfg(all(target_arch = "x86_64", feature = "guest_debug"))]
 use linux_loader::elf;
@@ -64,9 +64,8 @@ use linux_loader::loader::elf::PvhBootCapability::PvhEntryPresent;
 #[cfg(target_arch = "aarch64")]
 use linux_loader::loader::pe::Error::InvalidImageMagicNumber;
 use linux_loader::loader::KernelLoader;
-use seccompiler::{apply_filter, SeccompAction};
+use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
-use signal_hook::{consts::SIGWINCH, iterator::backend::Handle, iterator::Signals};
 use std::cmp;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -80,7 +79,6 @@ use std::mem::size_of;
 use std::num::Wrapping;
 use std::ops::Deref;
 use std::os::unix::net::UnixStream;
-use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::Instant;
 use std::{result, str, thread};
@@ -96,9 +94,7 @@ use vm_migration::{
     SnapshotData, Snapshottable, Transportable,
 };
 use vmm_sys_util::eventfd::EventFd;
-use vmm_sys_util::signal::unblock_signal;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
-use vmm_sys_util::terminal::Terminal;
 
 /// Errors associated with VM management
 #[derive(Debug, Error)]
@@ -140,12 +136,6 @@ pub enum Error {
 
     #[error("Error from device manager: {0:?}")]
     DeviceManager(DeviceManagerError),
-
-    #[error("Cannot setup terminal in raw mode: {0}")]
-    SetTerminalRaw(#[source] vmm_sys_util::errno::Error),
-
-    #[error("Cannot setup terminal in canonical mode.: {0}")]
-    SetTerminalCanon(#[source] vmm_sys_util::errno::Error),
 
     #[error("Cannot spawn a signal handler thread: {0}")]
     SignalHandlerSpawn(#[source] io::Error),
@@ -324,10 +314,10 @@ impl VmState {
     fn valid_transition(self, new_state: VmState) -> Result<()> {
         match self {
             VmState::Created => match new_state {
-                VmState::Created | VmState::Shutdown => {
-                    Err(Error::InvalidStateTransition(self, new_state))
+                VmState::Created => Err(Error::InvalidStateTransition(self, new_state)),
+                VmState::Running | VmState::Paused | VmState::BreakPoint | VmState::Shutdown => {
+                    Ok(())
                 }
-                VmState::Running | VmState::Paused | VmState::BreakPoint => Ok(()),
             },
 
             VmState::Running => match new_state {
@@ -427,8 +417,8 @@ impl VmOps for VmOpsHandler {
     }
 }
 
-pub fn physical_bits(max_phys_bits: u8) -> u8 {
-    let host_phys_bits = get_host_cpu_phys_bits();
+pub fn physical_bits(hypervisor: &Arc<dyn hypervisor::Hypervisor>, max_phys_bits: u8) -> u8 {
+    let host_phys_bits = get_host_cpu_phys_bits(hypervisor);
 
     cmp::min(host_phys_bits, max_phys_bits)
 }
@@ -440,8 +430,6 @@ pub struct Vm {
     threads: Vec<thread::JoinHandle<()>>,
     device_manager: Arc<Mutex<DeviceManager>>,
     config: Arc<Mutex<VmConfig>>,
-    on_tty: bool,
-    signals: Option<Handle>,
     state: RwLock<VmState>,
     cpu_manager: Arc<Mutex<cpu::CpuManager>>,
     memory_manager: Arc<Mutex<MemoryManager>>,
@@ -451,8 +439,7 @@ pub struct Vm {
     #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
     saved_clock: Option<hypervisor::ClockData>,
     numa_nodes: NumaNodes,
-    seccomp_action: SeccompAction,
-    exit_evt: EventFd,
+    #[cfg_attr(any(not(feature = "kvm"), target_arch = "aarch64"), allow(dead_code))]
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
     stop_on_boot: bool,
     load_payload_handle: Option<thread::JoinHandle<Result<EntryPoint>>>,
@@ -476,6 +463,7 @@ impl Vm {
         serial_pty: Option<PtyPair>,
         console_pty: Option<PtyPair>,
         console_resize_pipe: Option<File>,
+        original_termios: Arc<Mutex<Option<termios>>>,
         snapshot: Option<Snapshot>,
     ) -> Result<Self> {
         trace_scoped!("Vm::new_from_memory_manager");
@@ -597,11 +585,13 @@ impl Vm {
         device_manager
             .lock()
             .unwrap()
-            .create_devices(serial_pty, console_pty, console_resize_pipe)
+            .create_devices(
+                serial_pty,
+                console_pty,
+                console_resize_pipe,
+                original_termios,
+            )
             .map_err(Error::DeviceManager)?;
-
-        // SAFETY: trivially safe
-        let on_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } != 0;
 
         #[cfg(feature = "tdx")]
         let kernel = config
@@ -644,9 +634,7 @@ impl Vm {
             initramfs,
             device_manager,
             config,
-            on_tty,
             threads: Vec::with_capacity(1),
-            signals: None,
             state: RwLock::new(vm_state),
             cpu_manager,
             memory_manager,
@@ -654,8 +642,6 @@ impl Vm {
             #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
             saved_clock,
             numa_nodes,
-            seccomp_action: seccomp_action.clone(),
-            exit_evt,
             hypervisor,
             stop_on_boot,
             load_payload_handle,
@@ -754,6 +740,7 @@ impl Vm {
         serial_pty: Option<PtyPair>,
         console_pty: Option<PtyPair>,
         console_resize_pipe: Option<File>,
+        original_termios: Arc<Mutex<Option<termios>>>,
         snapshot: Option<Snapshot>,
         source_url: Option<&str>,
         prefault: Option<bool>,
@@ -775,7 +762,7 @@ impl Vm {
             tdx_enabled,
         )?;
 
-        let phys_bits = physical_bits(vm_config.lock().unwrap().cpus.max_phys_bits);
+        let phys_bits = physical_bits(&hypervisor, vm_config.lock().unwrap().cpus.max_phys_bits);
 
         let memory_manager = if let Some(snapshot) =
             snapshot_from_id(snapshot.as_ref(), MEMORY_MANAGER_SNAPSHOT_ID)
@@ -823,6 +810,7 @@ impl Vm {
             serial_pty,
             console_pty,
             console_resize_pipe,
+            original_termios,
             snapshot,
         )
     }
@@ -833,13 +821,11 @@ impl Vm {
     ) -> Result<Arc<dyn hypervisor::Vm>> {
         hypervisor.check_required_extensions().unwrap();
 
+        // 0 for KVM_X86_LEGACY_VM
+        // 1 for KVM_X86_TDX_VM
         #[cfg(feature = "tdx")]
         let vm = hypervisor
-            .create_vm_with_type(if tdx_enabled {
-                2 // KVM_X86_TDX_VM
-            } else {
-                0 // KVM_X86_LEGACY_VM
-            })
+            .create_vm_with_type(u64::from(tdx_enabled))
             .unwrap();
         #[cfg(not(feature = "tdx"))]
         let vm = hypervisor.create_vm().unwrap();
@@ -1215,20 +1201,6 @@ impl Vm {
 
         state.valid_transition(new_state)?;
 
-        if self.on_tty {
-            // Don't forget to set the terminal in canonical mode
-            // before to exit.
-            io::stdin()
-                .lock()
-                .set_canon_mode()
-                .map_err(Error::SetTerminalCanon)?;
-        }
-
-        // Trigger the termination of the signal_handler thread
-        if let Some(signals) = self.signals.take() {
-            signals.close();
-        }
-
         // Wake up the DeviceManager threads so they will get terminated cleanly
         self.device_manager
             .lock()
@@ -1286,7 +1258,7 @@ impl Vm {
                 .resize(desired_memory)
                 .map_err(Error::MemoryManager)?;
 
-            let mut memory_config = &mut self.config.lock().unwrap().memory;
+            let memory_config = &mut self.config.lock().unwrap().memory;
 
             if let Some(new_region) = &new_region {
                 self.device_manager
@@ -1634,18 +1606,6 @@ impl Vm {
         Ok(self.device_manager.lock().unwrap().counters())
     }
 
-    fn signal_handler(mut signals: Signals, console_input_clone: Arc<Console>) {
-        for sig in &Vm::HANDLED_SIGNALS {
-            unblock_signal(*sig).unwrap();
-        }
-
-        for signal in signals.forever() {
-            if signal == SIGWINCH {
-                console_input_clone.update_console_size();
-            }
-        }
-    }
-
     #[cfg(feature = "tdx")]
     fn extract_tdvf_sections(&mut self) -> Result<(Vec<TdvfSection>, bool)> {
         use arch::x86_64::tdx::*;
@@ -1942,60 +1902,6 @@ impl Vm {
         Ok(())
     }
 
-    fn setup_signal_handler(&mut self) -> Result<()> {
-        let console = self.device_manager.lock().unwrap().console().clone();
-        let signals = Signals::new(Vm::HANDLED_SIGNALS);
-        match signals {
-            Ok(signals) => {
-                self.signals = Some(signals.handle());
-                let exit_evt = self.exit_evt.try_clone().map_err(Error::EventFdClone)?;
-                let signal_handler_seccomp_filter = get_seccomp_filter(
-                    &self.seccomp_action,
-                    Thread::SignalHandler,
-                    self.hypervisor.hypervisor_type(),
-                )
-                .map_err(Error::CreateSeccompFilter)?;
-                self.threads.push(
-                    thread::Builder::new()
-                        .name("vm_signal_handler".to_string())
-                        .spawn(move || {
-                            if !signal_handler_seccomp_filter.is_empty() {
-                                if let Err(e) = apply_filter(&signal_handler_seccomp_filter)
-                                    .map_err(Error::ApplySeccompFilter)
-                                {
-                                    error!("Error applying seccomp filter: {:?}", e);
-                                    exit_evt.write(1).ok();
-                                    return;
-                                }
-                            }
-                            std::panic::catch_unwind(AssertUnwindSafe(|| {
-                                Vm::signal_handler(signals, console);
-                            }))
-                            .map_err(|_| {
-                                error!("signal_handler thead panicked");
-                                exit_evt.write(1).ok()
-                            })
-                            .ok();
-                        })
-                        .map_err(Error::SignalHandlerSpawn)?,
-                );
-            }
-            Err(e) => error!("Signal not found {}", e),
-        }
-        Ok(())
-    }
-
-    fn setup_tty(&self) -> Result<()> {
-        if self.on_tty {
-            io::stdin()
-                .lock()
-                .set_raw_mode()
-                .map_err(Error::SetTerminalRaw)?;
-        }
-
-        Ok(())
-    }
-
     // Creates ACPI tables
     // In case of TDX being used, this is a no-op since the tables will be
     // created and passed when populating the HOB.
@@ -2049,9 +1955,6 @@ impl Vm {
         #[cfg(target_arch = "x86_64")]
         let rsdp_addr = self.create_acpi_tables();
 
-        self.setup_signal_handler()?;
-        self.setup_tty()?;
-
         // Load kernel synchronously or if asynchronous then wait for load to
         // finish.
         let entry_point = self.entry_point()?;
@@ -2101,6 +2004,18 @@ impl Vm {
             })
             .transpose()?;
 
+        #[cfg(target_arch = "x86_64")]
+        // Note: For x86, always call this function before invoking start boot vcpus.
+        // Otherwise guest would fail to boot because we haven't created the
+        // userspace mappings to update the hypervisor about the memory mappings.
+        // These mappings must be created before we start the vCPU threads for
+        // the very first time.
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .allocate_address_space()
+            .map_err(Error::MemoryManager)?;
+
         #[cfg(feature = "tdx")]
         if let Some(hob_address) = hob_address {
             // With the HOB address extracted the vCPUs can have
@@ -2133,15 +2048,24 @@ impl Vm {
     pub fn restore(&mut self) -> Result<()> {
         event!("vm", "restoring");
 
+        #[cfg(target_arch = "x86_64")]
+        // Note: For x86, always call this function before invoking start boot vcpus.
+        // Otherwise guest would fail to boot because we haven't created the
+        // userspace mappings to update the hypervisor about the memory mappings.
+        // These mappings must be created before we start the vCPU threads for
+        // the very first time for the restored VM.
+        self.memory_manager
+            .lock()
+            .unwrap()
+            .allocate_address_space()
+            .map_err(Error::MemoryManager)?;
+
         // Now we can start all vCPUs from here.
         self.cpu_manager
             .lock()
             .unwrap()
             .start_restored_vcpus()
             .map_err(Error::CpuManager)?;
-
-        self.setup_signal_handler()?;
-        self.setup_tty()?;
 
         event!("vm", "restored");
         Ok(())
@@ -2489,7 +2413,10 @@ impl Snapshottable for Vm {
 
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
         let common_cpuid = {
-            let phys_bits = physical_bits(self.config.lock().unwrap().cpus.max_phys_bits);
+            let phys_bits = physical_bits(
+                &self.hypervisor,
+                self.config.lock().unwrap().cpus.max_phys_bits,
+            );
             arch::generate_common_cpuid(
                 &self.hypervisor,
                 None,
@@ -2770,7 +2697,7 @@ mod tests {
                 // Check the transitions from Created
                 assert!(state.valid_transition(VmState::Created).is_err());
                 assert!(state.valid_transition(VmState::Running).is_ok());
-                assert!(state.valid_transition(VmState::Shutdown).is_err());
+                assert!(state.valid_transition(VmState::Shutdown).is_ok());
                 assert!(state.valid_transition(VmState::Paused).is_ok());
                 assert!(state.valid_transition(VmState::BreakPoint).is_ok());
             }

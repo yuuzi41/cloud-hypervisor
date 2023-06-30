@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
-use crate::api::http_endpoint::{VmActionHandler, VmCreate, VmInfo, VmmPing, VmmShutdown};
+use self::http_endpoint::{VmActionHandler, VmCreate, VmInfo, VmmPing, VmmShutdown};
 use crate::api::{ApiError, ApiRequest, VmAction};
 use crate::seccomp_filters::{get_seccomp_filter, Thread};
 use crate::{Error as VmmError, Result};
@@ -22,6 +22,8 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::thread;
 use vmm_sys_util::eventfd::EventFd;
+
+pub mod http_endpoint;
 
 /// Errors associated with VMM management
 #[derive(Debug)]
@@ -282,7 +284,7 @@ fn start_http_thread(
     hypervisor_type: HypervisorType,
 ) -> Result<thread::JoinHandle<Result<()>>> {
     // Retrieve seccomp filter for API thread
-    let api_seccomp_filter = get_seccomp_filter(seccomp_action, Thread::Api, hypervisor_type)
+    let api_seccomp_filter = get_seccomp_filter(seccomp_action, Thread::HttpApi, hypervisor_type)
         .map_err(VmmError::CreateSeccompFilter)?;
 
     thread::Builder::new()

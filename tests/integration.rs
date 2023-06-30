@@ -30,6 +30,9 @@ use test_infra::*;
 use vmm_sys_util::{tempdir::TempDir, tempfile::TempFile};
 use wait_timeout::ChildExt;
 
+// Constant taken from the VMM crate.
+const MAX_NUM_PCI_SEGMENTS: u16 = 96;
+
 #[cfg(target_arch = "x86_64")]
 mod x86_64 {
     pub const FOCAL_IMAGE_NAME: &str = "focal-server-cloudimg-amd64-custom-20210609-0.raw";
@@ -37,8 +40,8 @@ mod x86_64 {
     pub const FOCAL_IMAGE_NAME_QCOW2: &str = "focal-server-cloudimg-amd64-custom-20210609-0.qcow2";
     pub const FOCAL_IMAGE_NAME_VHD: &str = "focal-server-cloudimg-amd64-custom-20210609-0.vhd";
     pub const FOCAL_IMAGE_NAME_VHDX: &str = "focal-server-cloudimg-amd64-custom-20210609-0.vhdx";
-    pub const JAMMY_IMAGE_NAME: &str = "jammy-server-cloudimg-amd64-custom-20221118-1.raw";
-    pub const WINDOWS_IMAGE_NAME: &str = "windows-server-2019.raw";
+    pub const JAMMY_IMAGE_NAME: &str = "jammy-server-cloudimg-amd64-custom-20230119-0.raw";
+    pub const WINDOWS_IMAGE_NAME: &str = "windows-server-2022-amd64-2.raw";
     pub const OVMF_NAME: &str = "CLOUDHV.fd";
     pub const GREP_SERIAL_IRQ_CMD: &str = "grep -c 'IO-APIC.*ttyS0' /proc/interrupts || true";
 }
@@ -69,6 +72,324 @@ const DIRECT_KERNEL_BOOT_CMDLINE: &str =
     "root=/dev/vda1 console=hvc0 rw systemd.journald.forward_to_console=1";
 
 const CONSOLE_TEST_STRING: &str = "Started OpenBSD Secure Shell server";
+
+// This enum exists to make it more convenient to
+// implement test for both D-Bus and REST APIs.
+enum TargetApi {
+    // API socket
+    HttpApi(String),
+    // well known service name, object path
+    DBusApi(String, String),
+}
+
+impl TargetApi {
+    fn new_http_api(tmp_dir: &TempDir) -> Self {
+        Self::HttpApi(temp_api_path(tmp_dir))
+    }
+
+    fn new_dbus_api(tmp_dir: &TempDir) -> Self {
+        // `tmp_dir` is in the form of "/tmp/chXXXXXX"
+        // and we take the `chXXXXXX` part as a unique identifier for the guest
+        let id = tmp_dir.as_path().file_name().unwrap().to_str().unwrap();
+
+        Self::DBusApi(
+            format!("org.cloudhypervisor.{id}"),
+            format!("/org/cloudhypervisor/{id}"),
+        )
+    }
+
+    fn guest_args(&self) -> Vec<&str> {
+        match self {
+            TargetApi::HttpApi(api_socket) => {
+                vec!["--api-socket", api_socket.as_str()]
+            }
+            TargetApi::DBusApi(service_name, object_path) => {
+                vec![
+                    "--dbus-service-name",
+                    service_name.as_str(),
+                    "--dbus-object-path",
+                    object_path.as_str(),
+                ]
+            }
+        }
+    }
+
+    fn remote_args(&self) -> Vec<&str> {
+        // `guest_args` and `remote_args` are consistent with each other
+        self.guest_args()
+    }
+
+    fn remote_command(&self, command: &str, arg: Option<&str>) -> bool {
+        let mut cmd = Command::new(clh_command("ch-remote"));
+        cmd.args(self.remote_args());
+        cmd.arg(command);
+
+        if let Some(arg) = arg {
+            cmd.arg(arg);
+        }
+
+        let output = cmd.output().unwrap();
+        if output.status.success() {
+            true
+        } else {
+            eprintln!("Error running ch-remote command: {:?}", &cmd);
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            eprintln!("stderr: {stderr}");
+            false
+        }
+    }
+}
+
+// Start cloud-hypervisor with no VM parameters, only the API server running.
+// From the API: Create a VM, boot it and check that it looks as expected.
+fn _test_api_create_boot(target_api: TargetApi, guest: Guest) {
+    let mut child = GuestCommand::new(&guest)
+        .args(target_api.guest_args())
+        .capture_output()
+        .spawn()
+        .unwrap();
+
+    thread::sleep(std::time::Duration::new(1, 0));
+
+    // Verify API server is running
+    assert!(target_api.remote_command("ping", None));
+
+    // Create the VM first
+    let cpu_count: u8 = 4;
+    let request_body = guest.api_create_body(
+        cpu_count,
+        direct_kernel_boot_path().to_str().unwrap(),
+        DIRECT_KERNEL_BOOT_CMDLINE,
+    );
+
+    let temp_config_path = guest.tmp_dir.as_path().join("config");
+    std::fs::write(&temp_config_path, request_body).unwrap();
+    let create_config = temp_config_path.as_os_str().to_str().unwrap();
+
+    assert!(target_api.remote_command("create", Some(create_config),));
+
+    // Then boot it
+    assert!(target_api.remote_command("boot", None));
+    thread::sleep(std::time::Duration::new(20, 0));
+
+    let r = std::panic::catch_unwind(|| {
+        // Check that the VM booted as expected
+        assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
+        assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+    });
+
+    let _ = child.kill();
+    let output = child.wait_with_output().unwrap();
+
+    handle_child_output(r, &output);
+}
+
+// Start cloud-hypervisor with no VM parameters, only the API server running.
+// From the API: Create a VM, boot it and check it can be shutdown and then
+// booted again
+fn _test_api_shutdown(target_api: TargetApi, guest: Guest) {
+    let mut child = GuestCommand::new(&guest)
+        .args(target_api.guest_args())
+        .capture_output()
+        .spawn()
+        .unwrap();
+
+    thread::sleep(std::time::Duration::new(1, 0));
+
+    // Verify API server is running
+    assert!(target_api.remote_command("ping", None));
+
+    // Create the VM first
+    let cpu_count: u8 = 4;
+    let request_body = guest.api_create_body(
+        cpu_count,
+        direct_kernel_boot_path().to_str().unwrap(),
+        DIRECT_KERNEL_BOOT_CMDLINE,
+    );
+
+    let temp_config_path = guest.tmp_dir.as_path().join("config");
+    std::fs::write(&temp_config_path, request_body).unwrap();
+    let create_config = temp_config_path.as_os_str().to_str().unwrap();
+
+    let r = std::panic::catch_unwind(|| {
+        assert!(target_api.remote_command("create", Some(create_config)));
+
+        // Then boot it
+        assert!(target_api.remote_command("boot", None));
+
+        guest.wait_vm_boot(None).unwrap();
+
+        // Check that the VM booted as expected
+        assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
+        assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+
+        // Sync and shutdown without powering off to prevent filesystem
+        // corruption.
+        guest.ssh_command("sync").unwrap();
+        guest.ssh_command("sudo shutdown -H now").unwrap();
+
+        // Wait for the guest to be fully shutdown
+        thread::sleep(std::time::Duration::new(20, 0));
+
+        // Then shut it down
+        assert!(target_api.remote_command("shutdown", None));
+
+        // Then boot it again
+        assert!(target_api.remote_command("boot", None));
+
+        guest.wait_vm_boot(None).unwrap();
+
+        // Check that the VM booted as expected
+        assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
+        assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+    });
+
+    let _ = child.kill();
+    let output = child.wait_with_output().unwrap();
+
+    handle_child_output(r, &output);
+}
+
+// Start cloud-hypervisor with no VM parameters, only the API server running.
+// From the API: Create a VM, boot it and check it can be deleted and then recreated
+// booted again.
+fn _test_api_delete(target_api: TargetApi, guest: Guest) {
+    let mut child = GuestCommand::new(&guest)
+        .args(target_api.guest_args())
+        .capture_output()
+        .spawn()
+        .unwrap();
+
+    thread::sleep(std::time::Duration::new(1, 0));
+
+    // Verify API server is running
+    assert!(target_api.remote_command("ping", None));
+
+    // Create the VM first
+    let cpu_count: u8 = 4;
+    let request_body = guest.api_create_body(
+        cpu_count,
+        direct_kernel_boot_path().to_str().unwrap(),
+        DIRECT_KERNEL_BOOT_CMDLINE,
+    );
+    let temp_config_path = guest.tmp_dir.as_path().join("config");
+    std::fs::write(&temp_config_path, request_body).unwrap();
+    let create_config = temp_config_path.as_os_str().to_str().unwrap();
+
+    let r = std::panic::catch_unwind(|| {
+        assert!(target_api.remote_command("create", Some(create_config)));
+
+        // Then boot it
+        assert!(target_api.remote_command("boot", None));
+
+        guest.wait_vm_boot(None).unwrap();
+
+        // Check that the VM booted as expected
+        assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
+        assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+
+        // Sync and shutdown without powering off to prevent filesystem
+        // corruption.
+        guest.ssh_command("sync").unwrap();
+        guest.ssh_command("sudo shutdown -H now").unwrap();
+
+        // Wait for the guest to be fully shutdown
+        thread::sleep(std::time::Duration::new(20, 0));
+
+        // Then delete it
+        assert!(target_api.remote_command("delete", None));
+
+        assert!(target_api.remote_command("create", Some(create_config)));
+
+        // Then boot it again
+        assert!(target_api.remote_command("boot", None));
+
+        guest.wait_vm_boot(None).unwrap();
+
+        // Check that the VM booted as expected
+        assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
+        assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+    });
+
+    let _ = child.kill();
+    let output = child.wait_with_output().unwrap();
+
+    handle_child_output(r, &output);
+}
+
+// Start cloud-hypervisor with no VM parameters, only the API server running.
+// From the API: Create a VM, boot it and check that it looks as expected.
+// Then we pause the VM, check that it's no longer available.
+// Finally we resume the VM and check that it's available.
+fn _test_api_pause_resume(target_api: TargetApi, guest: Guest) {
+    let mut child = GuestCommand::new(&guest)
+        .args(target_api.guest_args())
+        .capture_output()
+        .spawn()
+        .unwrap();
+
+    thread::sleep(std::time::Duration::new(1, 0));
+
+    // Verify API server is running
+    assert!(target_api.remote_command("ping", None));
+
+    // Create the VM first
+    let cpu_count: u8 = 4;
+    let request_body = guest.api_create_body(
+        cpu_count,
+        direct_kernel_boot_path().to_str().unwrap(),
+        DIRECT_KERNEL_BOOT_CMDLINE,
+    );
+
+    let temp_config_path = guest.tmp_dir.as_path().join("config");
+    std::fs::write(&temp_config_path, request_body).unwrap();
+    let create_config = temp_config_path.as_os_str().to_str().unwrap();
+
+    assert!(target_api.remote_command("create", Some(create_config)));
+
+    // Then boot it
+    assert!(target_api.remote_command("boot", None));
+    thread::sleep(std::time::Duration::new(20, 0));
+
+    let r = std::panic::catch_unwind(|| {
+        // Check that the VM booted as expected
+        assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
+        assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+
+        // We now pause the VM
+        assert!(target_api.remote_command("pause", None));
+
+        // Check pausing again fails
+        assert!(!target_api.remote_command("pause", None));
+
+        thread::sleep(std::time::Duration::new(2, 0));
+
+        // SSH into the VM should fail
+        assert!(ssh_command_ip(
+            "grep -c processor /proc/cpuinfo",
+            &guest.network.guest_ip,
+            2,
+            5
+        )
+        .is_err());
+
+        // Resume the VM
+        assert!(target_api.remote_command("resume", None));
+
+        // Check resuming again fails
+        assert!(!target_api.remote_command("resume", None));
+
+        thread::sleep(std::time::Duration::new(2, 0));
+
+        // Now we should be able to SSH back in and get the right number of CPUs
+        assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
+    });
+
+    let _ = child.kill();
+    let output = child.wait_with_output().unwrap();
+
+    handle_child_output(r, &output);
+}
 
 fn prepare_virtiofsd(tmp_dir: &TempDir, shared_dir: &str) -> (std::process::Child, String) {
     let mut workload_path = dirs::home_dir().unwrap();
@@ -224,24 +545,32 @@ fn prepare_vhost_user_net_daemon(
     (command, vunet_socket_path)
 }
 
-fn curl_command(api_socket: &str, method: &str, url: &str, http_body: Option<&str>) {
-    let mut curl_args: Vec<&str> = ["--unix-socket", api_socket, "-i", "-X", method, url].to_vec();
+fn prepare_swtpm_daemon(tmp_dir: &TempDir) -> (std::process::Command, String) {
+    let swtpm_tpm_dir = String::from(tmp_dir.as_path().join("swtpm").to_str().unwrap());
+    let swtpm_socket_path = String::from(
+        tmp_dir
+            .as_path()
+            .join("swtpm")
+            .join("swtpm.sock")
+            .to_str()
+            .unwrap(),
+    );
+    std::fs::create_dir(&swtpm_tpm_dir).unwrap();
 
-    if let Some(body) = http_body {
-        curl_args.push("-H");
-        curl_args.push("Accept: application/json");
-        curl_args.push("-H");
-        curl_args.push("Content-Type: application/json");
-        curl_args.push("-d");
-        curl_args.push(body);
-    }
+    let mut swtpm_command = Command::new("swtpm");
+    let swtpm_args = [
+        "socket",
+        "--tpmstate",
+        &format!("dir={swtpm_tpm_dir}"),
+        "--ctrl",
+        &format!("type=unixio,path={swtpm_socket_path}"),
+        "--flags",
+        "startup-clear",
+        "--tpm2",
+    ];
+    swtpm_command.args(swtpm_args);
 
-    let status = Command::new("curl")
-        .args(curl_args)
-        .status()
-        .expect("Failed to launch curl command");
-
-    assert!(status.success());
+    (swtpm_command, swtpm_socket_path)
 }
 
 fn remote_command(api_socket: &str, command: &str, arg: Option<&str>) -> bool {
@@ -1196,7 +1525,10 @@ fn _test_virtio_fs(
         .default_net()
         .args(["--api-socket", &api_socket]);
     if pci_segment.is_some() {
-        guest_command.args(["--platform", "num_pci_segments=16"]);
+        guest_command.args([
+            "--platform",
+            &format!("num_pci_segments={MAX_NUM_PCI_SEGMENTS}"),
+        ]);
     }
 
     let fs_params = format!(
@@ -1932,7 +2264,6 @@ mod common_parallel {
             guest.wait_vm_boot(Some(120)).unwrap();
 
             assert_eq!(guest.get_cpu_count().unwrap_or_default(), 1);
-            assert_eq!(guest.get_initial_apicid().unwrap_or(1), 0);
             assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
             assert_eq!(guest.get_pci_bridge_class().unwrap_or_default(), "0x060000");
 
@@ -2036,19 +2367,16 @@ mod common_parallel {
     }
 
     #[test]
-    #[cfg(not(feature = "mshv"))]
     fn test_cpu_topology_421() {
         test_cpu_topology(4, 2, 1, false);
     }
 
     #[test]
-    #[cfg(not(feature = "mshv"))]
     fn test_cpu_topology_142() {
         test_cpu_topology(1, 4, 2, false);
     }
 
     #[test]
-    #[cfg(not(feature = "mshv"))]
     fn test_cpu_topology_262() {
         test_cpu_topology(2, 6, 2, false);
     }
@@ -2220,7 +2548,7 @@ mod common_parallel {
                 "--memory-zone",
                 "id=mem0,size=1G,hotplug_size=2G",
                 "--memory-zone",
-                "id=mem1,size=1G,file=/dev/shm",
+                "id=mem1,size=1G,shared=on",
                 "--memory-zone",
                 "id=mem2,size=1G,host_numa_node=0,hotplug_size=2G",
             ])
@@ -2309,7 +2637,10 @@ mod common_parallel {
             .args(["--memory", "size=512M"])
             .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
             .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
-            .args(["--platform", "num_pci_segments=16,iommu_segments=[1]"])
+            .args([
+                "--platform",
+                &format!("num_pci_segments={MAX_NUM_PCI_SEGMENTS},iommu_segments=[1]"),
+            ])
             .default_disks()
             .capture_output()
             .default_net();
@@ -2465,7 +2796,10 @@ mod common_parallel {
             .args(["--memory", "size=512M"])
             .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
             .args(["--cmdline", DIRECT_KERNEL_BOOT_CMDLINE])
-            .args(["--platform", "num_pci_segments=16"])
+            .args([
+                "--platform",
+                &format!("num_pci_segments={MAX_NUM_PCI_SEGMENTS}"),
+            ])
             .args([
                 "--disk",
                 format!(
@@ -2492,15 +2826,15 @@ mod common_parallel {
         let grep_cmd = "lspci | grep \"Host bridge\" | wc -l";
 
         let r = std::panic::catch_unwind(|| {
-            // There should be 16 PCI host bridges in the guest.
+            // There should be MAX_NUM_PCI_SEGMENTS PCI host bridges in the guest.
             assert_eq!(
                 guest
                     .ssh_command(grep_cmd)
                     .unwrap()
                     .trim()
-                    .parse::<u32>()
+                    .parse::<u16>()
                     .unwrap_or_default(),
-                16
+                MAX_NUM_PCI_SEGMENTS
             );
 
             // Check both if /dev/vdc exists and if the block size is 4M.
@@ -3716,7 +4050,7 @@ mod common_parallel {
     // line (We tag the command line from cloud-hypervisor for that purpose).
     // The third device is added to validate that hotplug works correctly since
     // it is being added to the L2 VM through hotplugging mechanism.
-    // Also, we pass-through a vitio-blk device to the L2 VM to test the 32-bit
+    // Also, we pass-through a virtio-blk device to the L2 VM to test the 32-bit
     // vfio device support
     fn test_vfio() {
         setup_vfio_network_interfaces();
@@ -3961,7 +4295,7 @@ mod common_parallel {
                 .ssh_command_l1(
                     "sudo /mnt/ch-remote \
                  --api-socket /tmp/ch_api.sock \
-                 resize --memory=1073741824",
+                 resize --memory 1073741824",
                 )
                 .unwrap();
             assert!(guest.get_total_memory_l2().unwrap_or_default() > 960_000);
@@ -4020,299 +4354,35 @@ mod common_parallel {
     }
 
     #[test]
-    // Start cloud-hypervisor with no VM parameters, only the API server running.
-    // From the API: Create a VM, boot it and check that it looks as expected.
-    fn test_api_create_boot() {
+    fn test_api_http_shutdown() {
         let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(focal));
 
-        let api_socket = temp_api_path(&guest.tmp_dir);
-
-        let mut child = GuestCommand::new(&guest)
-            .args(["--api-socket", &api_socket])
-            .capture_output()
-            .spawn()
-            .unwrap();
-
-        thread::sleep(std::time::Duration::new(1, 0));
-
-        // Verify API server is running
-        curl_command(&api_socket, "GET", "http://localhost/api/v1/vmm.ping", None);
-
-        // Create the VM first
-        let cpu_count: u8 = 4;
-        let http_body = guest.api_create_body(
-            cpu_count,
-            direct_kernel_boot_path().to_str().unwrap(),
-            DIRECT_KERNEL_BOOT_CMDLINE,
-        );
-
-        let temp_config_path = guest.tmp_dir.as_path().join("config");
-        std::fs::write(&temp_config_path, http_body).unwrap();
-
-        remote_command(
-            &api_socket,
-            "create",
-            Some(temp_config_path.as_os_str().to_str().unwrap()),
-        );
-
-        // Then boot it
-        remote_command(&api_socket, "boot", None);
-        thread::sleep(std::time::Duration::new(20, 0));
-
-        let r = std::panic::catch_unwind(|| {
-            // Check that the VM booted as expected
-            assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
-            assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
-        });
-
-        let _ = child.kill();
-        let output = child.wait_with_output().unwrap();
-
-        handle_child_output(r, &output);
+        _test_api_shutdown(TargetApi::new_http_api(&guest.tmp_dir), guest)
     }
 
     #[test]
-    // Start cloud-hypervisor with no VM parameters, only the API server running.
-    // From the API: Create a VM, boot it and check it can be shutdown and then
-    // booted again
-    fn test_api_shutdown() {
+    fn test_api_http_delete() {
         let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(focal));
 
-        let api_socket = temp_api_path(&guest.tmp_dir);
-
-        let mut child = GuestCommand::new(&guest)
-            .args(["--api-socket", &api_socket])
-            .capture_output()
-            .spawn()
-            .unwrap();
-
-        thread::sleep(std::time::Duration::new(1, 0));
-
-        // Verify API server is running
-        curl_command(&api_socket, "GET", "http://localhost/api/v1/vmm.ping", None);
-
-        // Create the VM first
-        let cpu_count: u8 = 4;
-        let http_body = guest.api_create_body(
-            cpu_count,
-            direct_kernel_boot_path().to_str().unwrap(),
-            DIRECT_KERNEL_BOOT_CMDLINE,
-        );
-
-        let r = std::panic::catch_unwind(|| {
-            curl_command(
-                &api_socket,
-                "PUT",
-                "http://localhost/api/v1/vm.create",
-                Some(&http_body),
-            );
-
-            // Then boot it
-            curl_command(&api_socket, "PUT", "http://localhost/api/v1/vm.boot", None);
-
-            guest.wait_vm_boot(None).unwrap();
-
-            // Check that the VM booted as expected
-            assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
-            assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
-
-            // Sync and shutdown without powering off to prevent filesystem
-            // corruption.
-            guest.ssh_command("sync").unwrap();
-            guest.ssh_command("sudo shutdown -H now").unwrap();
-
-            // Wait for the guest to be fully shutdown
-            thread::sleep(std::time::Duration::new(20, 0));
-
-            // Then shut it down
-            curl_command(
-                &api_socket,
-                "PUT",
-                "http://localhost/api/v1/vm.shutdown",
-                None,
-            );
-
-            // Then boot it again
-            curl_command(&api_socket, "PUT", "http://localhost/api/v1/vm.boot", None);
-
-            guest.wait_vm_boot(None).unwrap();
-
-            // Check that the VM booted as expected
-            assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
-            assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
-        });
-
-        let _ = child.kill();
-        let output = child.wait_with_output().unwrap();
-
-        handle_child_output(r, &output);
+        _test_api_delete(TargetApi::new_http_api(&guest.tmp_dir), guest);
     }
 
     #[test]
-    // Start cloud-hypervisor with no VM parameters, only the API server running.
-    // From the API: Create a VM, boot it and check it can be deleted and then recreated
-    // booted again.
-    fn test_api_delete() {
+    fn test_api_http_pause_resume() {
         let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(focal));
 
-        let api_socket = temp_api_path(&guest.tmp_dir);
-
-        let mut child = GuestCommand::new(&guest)
-            .args(["--api-socket", &api_socket])
-            .capture_output()
-            .spawn()
-            .unwrap();
-
-        thread::sleep(std::time::Duration::new(1, 0));
-
-        // Verify API server is running
-        curl_command(&api_socket, "GET", "http://localhost/api/v1/vmm.ping", None);
-
-        // Create the VM first
-        let cpu_count: u8 = 4;
-        let http_body = guest.api_create_body(
-            cpu_count,
-            direct_kernel_boot_path().to_str().unwrap(),
-            DIRECT_KERNEL_BOOT_CMDLINE,
-        );
-
-        let r = std::panic::catch_unwind(|| {
-            curl_command(
-                &api_socket,
-                "PUT",
-                "http://localhost/api/v1/vm.create",
-                Some(&http_body),
-            );
-
-            // Then boot it
-            curl_command(&api_socket, "PUT", "http://localhost/api/v1/vm.boot", None);
-
-            guest.wait_vm_boot(None).unwrap();
-
-            // Check that the VM booted as expected
-            assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
-            assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
-
-            // Sync and shutdown without powering off to prevent filesystem
-            // corruption.
-            guest.ssh_command("sync").unwrap();
-            guest.ssh_command("sudo shutdown -H now").unwrap();
-
-            // Wait for the guest to be fully shutdown
-            thread::sleep(std::time::Duration::new(20, 0));
-
-            // Then delete it
-            curl_command(
-                &api_socket,
-                "PUT",
-                "http://localhost/api/v1/vm.delete",
-                None,
-            );
-
-            curl_command(
-                &api_socket,
-                "PUT",
-                "http://localhost/api/v1/vm.create",
-                Some(&http_body),
-            );
-
-            // Then boot it again
-            curl_command(&api_socket, "PUT", "http://localhost/api/v1/vm.boot", None);
-
-            guest.wait_vm_boot(None).unwrap();
-
-            // Check that the VM booted as expected
-            assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
-            assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
-        });
-
-        let _ = child.kill();
-        let output = child.wait_with_output().unwrap();
-
-        handle_child_output(r, &output);
+        _test_api_pause_resume(TargetApi::new_http_api(&guest.tmp_dir), guest)
     }
 
     #[test]
-    // Start cloud-hypervisor with no VM parameters, only the API server running.
-    // From the API: Create a VM, boot it and check that it looks as expected.
-    // Then we pause the VM, check that it's no longer available.
-    // Finally we resume the VM and check that it's available.
-    fn test_api_pause_resume() {
+    fn test_api_http_create_boot() {
         let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(focal));
 
-        let api_socket = temp_api_path(&guest.tmp_dir);
-
-        let mut child = GuestCommand::new(&guest)
-            .args(["--api-socket", &api_socket])
-            .capture_output()
-            .spawn()
-            .unwrap();
-
-        thread::sleep(std::time::Duration::new(1, 0));
-
-        // Verify API server is running
-        curl_command(&api_socket, "GET", "http://localhost/api/v1/vmm.ping", None);
-
-        // Create the VM first
-        let cpu_count: u8 = 4;
-        let http_body = guest.api_create_body(
-            cpu_count,
-            direct_kernel_boot_path().to_str().unwrap(),
-            DIRECT_KERNEL_BOOT_CMDLINE,
-        );
-        curl_command(
-            &api_socket,
-            "PUT",
-            "http://localhost/api/v1/vm.create",
-            Some(&http_body),
-        );
-
-        // Then boot it
-        curl_command(&api_socket, "PUT", "http://localhost/api/v1/vm.boot", None);
-        thread::sleep(std::time::Duration::new(20, 0));
-
-        let r = std::panic::catch_unwind(|| {
-            // Check that the VM booted as expected
-            assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
-            assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
-
-            // We now pause the VM
-            assert!(remote_command(&api_socket, "pause", None));
-
-            // Check pausing again fails
-            assert!(!remote_command(&api_socket, "pause", None));
-
-            thread::sleep(std::time::Duration::new(2, 0));
-
-            // SSH into the VM should fail
-            assert!(ssh_command_ip(
-                "grep -c processor /proc/cpuinfo",
-                &guest.network.guest_ip,
-                2,
-                5
-            )
-            .is_err());
-
-            // Resume the VM
-            assert!(remote_command(&api_socket, "resume", None));
-
-            // Check resuming again fails
-            assert!(!remote_command(&api_socket, "resume", None));
-
-            thread::sleep(std::time::Duration::new(2, 0));
-
-            // Now we should be able to SSH back in and get the right number of CPUs
-            assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
-        });
-
-        let _ = child.kill();
-        let output = child.wait_with_output().unwrap();
-
-        handle_child_output(r, &output);
+        _test_api_create_boot(TargetApi::new_http_api(&guest.tmp_dir), guest)
     }
 
     #[test]
@@ -4926,7 +4996,6 @@ mod common_parallel {
         handle_child_output(r, &output);
     }
 
-    #[allow(clippy::useless_conversion)]
     fn create_loop_device(backing_file_path: &str, block_size: u32, num_retries: usize) -> String {
         const LOOP_CONFIGURE: u64 = 0x4c0a;
         const LOOP_CTL_GET_FREE: u64 = 0x4c82;
@@ -4987,12 +5056,9 @@ mod common_parallel {
             .unwrap();
 
         // Request a free loop device
-        let loop_device_number = unsafe {
-            libc::ioctl(
-                loop_ctl_file.as_raw_fd(),
-                LOOP_CTL_GET_FREE.try_into().unwrap(),
-            )
-        };
+        let loop_device_number =
+            unsafe { libc::ioctl(loop_ctl_file.as_raw_fd(), LOOP_CTL_GET_FREE as _) };
+
         if loop_device_number < 0 {
             panic!("Couldn't find a free loop device");
         }
@@ -5024,7 +5090,7 @@ mod common_parallel {
             let ret = unsafe {
                 libc::ioctl(
                     loop_device_file.as_raw_fd(),
-                    LOOP_CONFIGURE.try_into().unwrap(),
+                    LOOP_CONFIGURE as _,
                     &loop_config,
                 )
             };
@@ -5209,6 +5275,7 @@ mod common_parallel {
     }
 
     #[test]
+    #[cfg(not(feature = "mshv"))]
     fn test_virtio_balloon_free_page_reporting() {
         let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
         let guest = Guest::new(Box::new(focal));
@@ -5308,7 +5375,10 @@ mod common_parallel {
             .capture_output();
 
         if pci_segment.is_some() {
-            cmd.args(["--platform", "num_pci_segments=16"]);
+            cmd.args([
+                "--platform",
+                &format!("num_pci_segments={MAX_NUM_PCI_SEGMENTS}"),
+            ]);
         }
 
         let mut child = cmd.spawn().unwrap();
@@ -5444,7 +5514,10 @@ mod common_parallel {
             .capture_output();
 
         if pci_segment.is_some() {
-            cmd.args(["--platform", "num_pci_segments=16"]);
+            cmd.args([
+                "--platform",
+                &format!("num_pci_segments={MAX_NUM_PCI_SEGMENTS}"),
+            ]);
         }
 
         let mut child = cmd.spawn().unwrap();
@@ -6247,6 +6320,18 @@ mod common_parallel {
                     .unwrap_or_default(),
                 2
             );
+
+            guest.reboot_linux(0, None);
+
+            assert_eq!(
+                guest
+                    .ssh_command("ip -o link | wc -l")
+                    .unwrap()
+                    .trim()
+                    .parse::<u32>()
+                    .unwrap_or_default(),
+                2
+            );
         });
 
         let _ = child.kill();
@@ -6260,11 +6345,13 @@ mod common_parallel {
     }
 
     #[test]
+    #[cfg_attr(target_arch = "aarch64", ignore = "See #5443")]
     fn test_macvtap() {
         _test_macvtap(false, "guestmacvtap0", "hostmacvtap0")
     }
 
     #[test]
+    #[cfg_attr(target_arch = "aarch64", ignore = "See #5443")]
     fn test_macvtap_hotplug() {
         _test_macvtap(true, "guestmacvtap1", "hostmacvtap1")
     }
@@ -6727,6 +6814,160 @@ mod common_parallel {
         let output = child.wait_with_output().unwrap();
 
         handle_child_output(r, &output);
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_tpm() {
+        let focal = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+
+        let (mut swtpm_command, swtpm_socket_path) = prepare_swtpm_daemon(&guest.tmp_dir);
+
+        let mut guest_cmd = GuestCommand::new(&guest);
+        guest_cmd
+            .args(["--cpus", "boot=1"])
+            .args(["--memory", "size=512M"])
+            .args(["--kernel", fw_path(FwType::RustHypervisorFirmware).as_str()])
+            .args(["--tpm", &format!("socket={swtpm_socket_path}")])
+            .capture_output()
+            .default_disks()
+            .default_net();
+
+        // Start swtpm daemon
+        let mut swtpm_child = swtpm_command.spawn().unwrap();
+        thread::sleep(std::time::Duration::new(10, 0));
+        let mut child = guest_cmd.spawn().unwrap();
+        let r = std::panic::catch_unwind(|| {
+            guest.wait_vm_boot(None).unwrap();
+            assert_eq!(
+                guest.ssh_command("ls /dev/tpm0").unwrap().trim(),
+                "/dev/tpm0"
+            );
+            guest.ssh_command("sudo tpm2_selftest -f").unwrap();
+            guest
+                .ssh_command("echo 'hello' > /tmp/checksum_test;  ")
+                .unwrap();
+            guest.ssh_command("cmp <(sudo tpm2_pcrevent  /tmp/checksum_test | grep sha256 | awk '{print $2}') <(sha256sum /tmp/checksum_test| awk '{print $1}')").unwrap();
+        });
+
+        let _ = swtpm_child.kill();
+        let _d_out = swtpm_child.wait_with_output().unwrap();
+
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+
+        handle_child_output(r, &output);
+    }
+}
+
+mod dbus_api {
+    use crate::*;
+
+    // Start cloud-hypervisor with no VM parameters, running both the HTTP
+    // and DBus APIs. Alternate calls to the external APIs (HTTP and DBus)
+    // to create a VM, boot it, and verify that it can be shut down and then
+    // booted again.
+    #[test]
+    fn test_api_dbus_and_http_interleaved() {
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+        let dbus_api = TargetApi::new_dbus_api(&guest.tmp_dir);
+        let http_api = TargetApi::new_http_api(&guest.tmp_dir);
+
+        let mut child = GuestCommand::new(&guest)
+            .args(dbus_api.guest_args())
+            .args(http_api.guest_args())
+            .capture_output()
+            .spawn()
+            .unwrap();
+
+        thread::sleep(std::time::Duration::new(1, 0));
+
+        // Verify API servers are running
+        assert!(dbus_api.remote_command("ping", None));
+        assert!(http_api.remote_command("ping", None));
+
+        // Create the VM first
+        let cpu_count: u8 = 4;
+        let request_body = guest.api_create_body(
+            cpu_count,
+            direct_kernel_boot_path().to_str().unwrap(),
+            DIRECT_KERNEL_BOOT_CMDLINE,
+        );
+
+        let temp_config_path = guest.tmp_dir.as_path().join("config");
+        std::fs::write(&temp_config_path, request_body).unwrap();
+        let create_config = temp_config_path.as_os_str().to_str().unwrap();
+
+        let r = std::panic::catch_unwind(|| {
+            // Create the VM
+            assert!(dbus_api.remote_command("create", Some(create_config),));
+
+            // Then boot it
+            assert!(http_api.remote_command("boot", None));
+            guest.wait_vm_boot(None).unwrap();
+
+            // Check that the VM booted as expected
+            assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
+            assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+
+            // Sync and shutdown without powering off to prevent filesystem
+            // corruption.
+            guest.ssh_command("sync").unwrap();
+            guest.ssh_command("sudo shutdown -H now").unwrap();
+
+            // Wait for the guest to be fully shutdown
+            thread::sleep(std::time::Duration::new(20, 0));
+
+            // Then shutdown the VM
+            assert!(dbus_api.remote_command("shutdown", None));
+
+            // Then boot it again
+            assert!(http_api.remote_command("boot", None));
+            guest.wait_vm_boot(None).unwrap();
+
+            // Check that the VM booted as expected
+            assert_eq!(guest.get_cpu_count().unwrap_or_default() as u8, cpu_count);
+            assert!(guest.get_total_memory().unwrap_or_default() > 480_000);
+        });
+
+        let _ = child.kill();
+        let output = child.wait_with_output().unwrap();
+
+        handle_child_output(r, &output);
+    }
+
+    #[test]
+    fn test_api_dbus_create_boot() {
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+
+        _test_api_create_boot(TargetApi::new_dbus_api(&guest.tmp_dir), guest)
+    }
+
+    #[test]
+    fn test_api_dbus_shutdown() {
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+
+        _test_api_shutdown(TargetApi::new_dbus_api(&guest.tmp_dir), guest)
+    }
+
+    #[test]
+    fn test_api_dbus_delete() {
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+
+        _test_api_delete(TargetApi::new_dbus_api(&guest.tmp_dir), guest);
+    }
+
+    #[test]
+    fn test_api_dbus_pause_resume() {
+        let focal = UbuntuDiskConfig::new(FOCAL_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(focal));
+
+        _test_api_pause_resume(TargetApi::new_dbus_api(&guest.tmp_dir), guest)
     }
 }
 
@@ -8041,7 +8282,7 @@ mod vfio {
                 .ssh_command_l1(
                     "sudo /mnt/ch-remote \
                  --api-socket /tmp/ch_api.sock \
-                 resize --memory=1073741824",
+                 resize --memory 1073741824",
                 )
                 .unwrap();
             assert!(guest.get_total_memory_l2().unwrap_or_default() > 960_000);
@@ -9263,51 +9504,43 @@ mod live_migration {
         }
 
         #[test]
-        #[ignore]
         fn test_live_upgrade_basic() {
             _test_live_migration(true, false)
         }
 
         #[test]
-        #[ignore]
         fn test_live_upgrade_local() {
             _test_live_migration(true, true)
         }
 
         #[test]
-        #[ignore]
         #[cfg(not(feature = "mshv"))]
         fn test_live_upgrade_numa() {
             _test_live_migration_numa(true, false)
         }
 
         #[test]
-        #[ignore]
         #[cfg(not(feature = "mshv"))]
         fn test_live_upgrade_numa_local() {
             _test_live_migration_numa(true, true)
         }
 
         #[test]
-        #[ignore]
         fn test_live_upgrade_watchdog() {
             _test_live_migration_watchdog(true, false)
         }
 
         #[test]
-        #[ignore]
         fn test_live_upgrade_watchdog_local() {
             _test_live_migration_watchdog(true, true)
         }
 
         #[test]
-        #[ignore]
         fn test_live_upgrade_balloon() {
             _test_live_migration_balloon(true, false)
         }
 
         #[test]
-        #[ignore]
         fn test_live_upgrade_balloon_local() {
             _test_live_migration_balloon(true, true)
         }
@@ -9334,7 +9567,6 @@ mod live_migration {
         }
 
         #[test]
-        #[ignore]
         #[cfg(target_arch = "x86_64")]
         #[cfg(not(feature = "mshv"))]
         fn test_live_upgrade_ovs_dpdk() {
@@ -9342,7 +9574,6 @@ mod live_migration {
         }
 
         #[test]
-        #[ignore]
         #[cfg(target_arch = "x86_64")]
         #[cfg(not(feature = "mshv"))]
         fn test_live_upgrade_ovs_dpdk_local() {

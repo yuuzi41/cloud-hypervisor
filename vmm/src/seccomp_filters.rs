@@ -12,7 +12,9 @@ use seccompiler::{
 use std::convert::TryInto;
 
 pub enum Thread {
-    Api,
+    HttpApi,
+    #[cfg(feature = "dbus_api")]
+    DBusApi,
     SignalHandler,
     Vcpu,
     Vmm,
@@ -41,6 +43,7 @@ macro_rules! or {
 const TCGETS: u64 = 0x5401;
 const TCSETS: u64 = 0x5402;
 const TIOCSCTTY: u64 = 0x540E;
+const TIOCGPGRP: u64 = 0x540F;
 const TIOCSPGRP: u64 = 0x5410;
 const TIOCGWINSZ: u64 = 0x5413;
 const TIOCSPTLCK: u64 = 0x4004_5431;
@@ -167,6 +170,7 @@ mod mshv {
     pub const MSHV_GET_GPA_ACCESS_STATES: u64 = 0xc01c_b812;
     pub const MSHV_VP_TRANSLATE_GVA: u64 = 0xc020_b80e;
     pub const MSHV_CREATE_PARTITION: u64 = 0x4030_b801;
+    pub const MSHV_VP_REGISTER_INTERCEPT_RESULT: u64 = 0x4030_b817;
 }
 #[cfg(feature = "mshv")]
 use mshv::*;
@@ -196,6 +200,12 @@ fn create_vmm_ioctl_seccomp_rule_common_mshv() -> Result<Vec<SeccompRule>, Backe
         and![Cond::new(1, ArgLen::Dword, Eq, MSHV_GET_GPA_ACCESS_STATES)?],
         and![Cond::new(1, ArgLen::Dword, Eq, MSHV_VP_TRANSLATE_GVA)?],
         and![Cond::new(1, ArgLen::Dword, Eq, MSHV_CREATE_PARTITION)?],
+        and![Cond::new(
+            1,
+            ArgLen::Dword,
+            Eq,
+            MSHV_VP_REGISTER_INTERCEPT_RESULT
+        )?],
     ])
 }
 
@@ -264,6 +274,7 @@ fn create_vmm_ioctl_seccomp_rule_common(
         and![Cond::new(1, ArgLen::Dword, Eq, SIOCSIFNETMASK)?],
         and![Cond::new(1, ArgLen::Dword, Eq, TCSETS)?],
         and![Cond::new(1, ArgLen::Dword, Eq, TCGETS)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, TIOCGPGRP)?],
         and![Cond::new(1, ArgLen::Dword, Eq, TIOCGTPEER)?],
         and![Cond::new(1, ArgLen::Dword, Eq, TIOCGWINSZ)?],
         and![Cond::new(1, ArgLen::Dword, Eq, TIOCSCTTY)?],
@@ -339,6 +350,7 @@ fn create_vmm_ioctl_seccomp_rule_kvm() -> Result<Vec<SeccompRule>, BackendError>
     const KVM_GET_MSR_INDEX_LIST: u64 = 0xc004_ae02;
     const KVM_GET_MSRS: u64 = 0xc008_ae88;
     const KVM_GET_SREGS: u64 = 0x8138_ae83;
+    const KVM_GET_TSC_KHZ: u64 = 0xaea3;
     const KVM_GET_XCRS: u64 = 0x8188_aea6;
     const KVM_GET_XSAVE: u64 = 0x9000_aea4;
     const KVM_KVMCLOCK_CTRL: u64 = 0xaead;
@@ -365,6 +377,7 @@ fn create_vmm_ioctl_seccomp_rule_kvm() -> Result<Vec<SeccompRule>, BackendError>
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_MSR_INDEX_LIST)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_MSRS)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_SREGS)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_TSC_KHZ)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_XCRS,)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_GET_XSAVE,)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_KVMCLOCK_CTRL)?],
@@ -453,6 +466,7 @@ fn signal_handler_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, Backend
 
 fn create_pty_foreground_ioctl_seccomp_rule() -> Result<Vec<SeccompRule>, BackendError> {
     Ok(or![
+        and![Cond::new(1, ArgLen::Dword, Eq, TIOCGPGRP)?],
         and![Cond::new(1, ArgLen::Dword, Eq, TIOCSCTTY)?],
         and![Cond::new(1, ArgLen::Dword, Eq, TIOCSPGRP)?],
     ])
@@ -472,6 +486,7 @@ fn pty_foreground_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, Backend
         #[cfg(target_arch = "aarch64")]
         (libc::SYS_ppoll, vec![]),
         (libc::SYS_read, vec![]),
+        (libc::SYS_restart_syscall, vec![]),
         (libc::SYS_rt_sigaction, vec![]),
         (libc::SYS_rt_sigreturn, vec![]),
         (libc::SYS_setsid, vec![]),
@@ -496,6 +511,7 @@ fn vmm_thread_rules(
         (libc::SYS_clone, vec![]),
         (libc::SYS_clone3, vec![]),
         (libc::SYS_close, vec![]),
+        (libc::SYS_close_range, vec![]),
         (libc::SYS_connect, vec![]),
         (libc::SYS_dup, vec![]),
         (libc::SYS_epoll_create1, vec![]),
@@ -517,6 +533,7 @@ fn vmm_thread_rules(
         #[cfg(target_arch = "aarch64")]
         (libc::SYS_newfstatat, vec![]),
         (libc::SYS_futex, vec![]),
+        (libc::SYS_getdents64, vec![]),
         (libc::SYS_getpgid, vec![]),
         #[cfg(target_arch = "x86_64")]
         (libc::SYS_getpgrp, vec![]),
@@ -582,6 +599,7 @@ fn vmm_thread_rules(
         (libc::SYS_sendto, vec![]),
         (libc::SYS_set_robust_list, vec![]),
         (libc::SYS_setsid, vec![]),
+        (libc::SYS_setsockopt, vec![]),
         (libc::SYS_shutdown, vec![]),
         (libc::SYS_sigaltstack, vec![]),
         (
@@ -594,6 +612,7 @@ fn vmm_thread_rules(
         (libc::SYS_socketpair, vec![]),
         #[cfg(target_arch = "x86_64")]
         (libc::SYS_stat, vec![]),
+        (libc::SYS_statfs, vec![]),
         (libc::SYS_statx, vec![]),
         (libc::SYS_tgkill, vec![]),
         (libc::SYS_timerfd_create, vec![]),
@@ -700,6 +719,7 @@ fn vcpu_thread_rules(
         (libc::SYS_madvise, vec![]),
         (libc::SYS_mmap, vec![]),
         (libc::SYS_mprotect, vec![]),
+        (libc::SYS_mremap, vec![]),
         (libc::SYS_munmap, vec![]),
         (libc::SYS_nanosleep, vec![]),
         (libc::SYS_newfstatat, vec![]),
@@ -728,9 +748,9 @@ fn vcpu_thread_rules(
     ])
 }
 
-// The filter containing the white listed syscall rules required by the API to
+// The filter containing the white listed syscall rules required by the HTTP API to
 // function.
-fn api_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
+fn http_api_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
     Ok(vec![
         (libc::SYS_accept4, vec![]),
         (libc::SYS_brk, vec![]),
@@ -757,12 +777,50 @@ fn api_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
     ])
 }
 
+// The filter containing the white listed syscall rules required by the D-Bus API
+// to function.
+#[cfg(feature = "dbus_api")]
+fn dbus_api_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
+    Ok(vec![
+        (libc::SYS_brk, vec![]),
+        (libc::SYS_clock_gettime, vec![]),
+        (libc::SYS_clone, vec![]),
+        (libc::SYS_clone3, vec![]),
+        (libc::SYS_close, vec![]),
+        (libc::SYS_dup, vec![]),
+        (libc::SYS_epoll_ctl, vec![]),
+        (libc::SYS_exit, vec![]),
+        (libc::SYS_futex, vec![]),
+        (libc::SYS_getrandom, vec![]),
+        (libc::SYS_madvise, vec![]),
+        (libc::SYS_mmap, vec![]),
+        (libc::SYS_mprotect, vec![]),
+        (libc::SYS_munmap, vec![]),
+        (libc::SYS_prctl, vec![]),
+        (libc::SYS_recvmsg, vec![]),
+        // musl is missing this constant
+        // (libc::SYS_rseq, vec![]),
+        #[cfg(target_arch = "x86_64")]
+        (334, vec![]),
+        #[cfg(target_arch = "aarch64")]
+        (293, vec![]),
+        (libc::SYS_rt_sigprocmask, vec![]),
+        (libc::SYS_sched_getaffinity, vec![]),
+        (libc::SYS_sendmsg, vec![]),
+        (libc::SYS_set_robust_list, vec![]),
+        (libc::SYS_sigaltstack, vec![]),
+        (libc::SYS_write, vec![]),
+    ])
+}
+
 fn get_seccomp_rules(
     thread_type: Thread,
     hypervisor_type: HypervisorType,
 ) -> Result<Vec<(i64, Vec<SeccompRule>)>, BackendError> {
     match thread_type {
-        Thread::Api => Ok(api_thread_rules()?),
+        Thread::HttpApi => Ok(http_api_thread_rules()?),
+        #[cfg(feature = "dbus_api")]
+        Thread::DBusApi => Ok(dbus_api_thread_rules()?),
         Thread::SignalHandler => Ok(signal_handler_thread_rules()?),
         Thread::Vcpu => Ok(vcpu_thread_rules(hypervisor_type)?),
         Thread::Vmm => Ok(vmm_thread_rules(hypervisor_type)?),

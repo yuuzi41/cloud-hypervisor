@@ -8,13 +8,11 @@ use anyhow::anyhow;
 use arch::aarch64::layout::{TPM_SIZE, TPM_START};
 #[cfg(target_arch = "x86_64")]
 use arch::x86_64::layout::{TPM_SIZE, TPM_START};
-use phf::phf_map;
 use std::cmp;
 use std::sync::{Arc, Barrier};
 use thiserror::Error;
 use tpm::emulator::{BackendCmd, Emulator};
 use tpm::TPM_CRB_BUFFER_MAX;
-use tpm::TPM_SUCCESS;
 use vm_device::BusDevice;
 
 #[derive(Error, Debug)]
@@ -23,62 +21,135 @@ pub enum Error {
     CheckCaps(#[source] anyhow::Error),
     #[error("Failed to initialize tpm: {0}")]
     Init(#[source] anyhow::Error),
-    #[error("Failed to deliver tpm Command: {0}")]
-    DeliverRequest(#[source] anyhow::Error),
 }
 type Result<T> = anyhow::Result<T, Error>;
+
+#[allow(dead_code)]
+enum LocStateFields {
+    TpmEstablished,
+    LocAssigned,
+    ActiveLocality,
+    Reserved,
+    TpmRegValidSts,
+}
+
+enum LocStsFields {
+    Granted,
+    BeenSeized,
+}
+
+#[allow(dead_code)]
+enum IntfIdFields {
+    InterfaceType,
+    InterfaceVersion,
+    CapLocality,
+    CapCRBIdleBypass,
+    Reserved1,
+    CapDataXferSizeSupport,
+    CapFIFO,
+    CapCRB,
+    CapIFRes,
+    InterfaceSelector,
+    IntfSelLock,
+    Reserved2,
+    Rid,
+}
+
+#[allow(dead_code)]
+enum IntfId2Fields {
+    Vid,
+    Did,
+}
+
+enum CtrlStsFields {
+    TpmSts,
+    TpmIdle,
+}
+
+enum CrbRegister {
+    LocState(LocStateFields),
+    LocSts(LocStsFields),
+    IntfId(IntfIdFields),
+    IntfId2(IntfId2Fields),
+    CtrlSts(CtrlStsFields),
+}
 
 /* crb 32-bit registers */
 const CRB_LOC_STATE: u32 = 0x0;
 //Register Fields
-// Field => (start, length)
-// start: lowest bit in the bit field numbered from 0
+// Field => (base, offset, length)
+// base:   starting position of the register
+// offset: lowest bit in the bit field numbered from 0
 // length: length of the bit field
-const CRB_LOC_STATE_FIELDS: phf::Map<&str, [u32; 2]> = phf_map! {
-    "tpmEstablished" => [0, 1],
-    "locAssigned" => [1,1],
-    "activeLocality"=> [2, 3],
-    "reserved" => [5, 2],
-    "tpmRegValidSts" => [7, 1]
-};
+const fn get_crb_loc_state_field(f: LocStateFields) -> (u32, u32, u32) {
+    let (offset, len) = match f {
+        LocStateFields::TpmEstablished => (0, 1),
+        LocStateFields::LocAssigned => (1, 1),
+        LocStateFields::ActiveLocality => (2, 3),
+        LocStateFields::Reserved => (5, 2),
+        LocStateFields::TpmRegValidSts => (7, 1),
+    };
+
+    (CRB_LOC_STATE, offset, len)
+}
+
 const CRB_LOC_CTRL: u32 = 0x08;
 const CRB_LOC_CTRL_REQUEST_ACCESS: u32 = 1 << 0;
 const CRB_LOC_CTRL_RELINQUISH: u32 = 1 << 1;
 const CRB_LOC_CTRL_RESET_ESTABLISHMENT_BIT: u32 = 1 << 3;
 const CRB_LOC_STS: u32 = 0x0C;
-const CRB_LOC_STS_FIELDS: phf::Map<&str, [u32; 2]> = phf_map! {
-    "Granted" => [0, 1],
-    "beenSeized" => [1,1]
-};
+const fn get_crb_loc_sts_field(f: LocStsFields) -> (u32, u32, u32) {
+    let (offset, len) = match f {
+        LocStsFields::Granted => (0, 1),
+        LocStsFields::BeenSeized => (1, 1),
+    };
+
+    (CRB_LOC_STS, offset, len)
+}
+
 const CRB_INTF_ID: u32 = 0x30;
-const CRB_INTF_ID_FIELDS: phf::Map<&str, [u32; 2]> = phf_map! {
-    "InterfaceType" => [0, 4],
-    "InterfaceVersion" => [4, 4],
-    "CapLocality" =>  [8, 1],
-    "CapCRBIdleBypass" => [9, 1],
-    "Reserved1" => [10, 1],
-    "CapDataXferSizeSupport" => [11, 2],
-    "CapFIFO" =>  [13, 1],
-    "CapCRB" => [14, 1],
-    "CapIFRes" => [15, 2],
-    "InterfaceSelector" => [17, 2],
-    "IntfSelLock" =>  [19, 1],
-    "Reserved2" => [20, 4],
-    "RID" => [24, 8]
-};
+const fn get_crb_intf_id_field(f: IntfIdFields) -> (u32, u32, u32) {
+    let (offset, len) = match f {
+        IntfIdFields::InterfaceType => (0, 4),
+        IntfIdFields::InterfaceVersion => (4, 4),
+        IntfIdFields::CapLocality => (8, 1),
+        IntfIdFields::CapCRBIdleBypass => (9, 1),
+        IntfIdFields::Reserved1 => (10, 1),
+        IntfIdFields::CapDataXferSizeSupport => (11, 2),
+        IntfIdFields::CapFIFO => (13, 1),
+        IntfIdFields::CapCRB => (14, 1),
+        IntfIdFields::CapIFRes => (15, 2),
+        IntfIdFields::InterfaceSelector => (17, 2),
+        IntfIdFields::IntfSelLock => (19, 1),
+        IntfIdFields::Reserved2 => (20, 4),
+        IntfIdFields::Rid => (24, 8),
+    };
+
+    (CRB_INTF_ID, offset, len)
+}
+
 const CRB_INTF_ID2: u32 = 0x34;
-const CRB_INTF_ID2_FIELDS: phf::Map<&str, [u32; 2]> = phf_map! {
-    "VID" => [0, 16],
-    "DID" => [16, 16]
-};
+const fn get_crb_intf_id2_field(f: IntfId2Fields) -> (u32, u32, u32) {
+    let (offset, len) = match f {
+        IntfId2Fields::Vid => (0, 16),
+        IntfId2Fields::Did => (16, 16),
+    };
+
+    (CRB_INTF_ID2, offset, len)
+}
+
 const CRB_CTRL_REQ: u32 = 0x40;
 const CRB_CTRL_REQ_CMD_READY: u32 = 1 << 0;
 const CRB_CTRL_REQ_GO_IDLE: u32 = 1 << 1;
 const CRB_CTRL_STS: u32 = 0x44;
-const CRB_CTRL_STS_FIELDS: phf::Map<&str, [u32; 2]> = phf_map! {
-    "tpmSts" => [0, 1],
-    "tpmIdle" => [1, 1]
-};
+const fn get_crb_ctrl_sts_field(f: CtrlStsFields) -> (u32, u32, u32) {
+    let (offset, len) = match f {
+        CtrlStsFields::TpmSts => (0, 1),
+        CtrlStsFields::TpmIdle => (1, 1),
+    };
+
+    (CRB_CTRL_STS, offset, len)
+}
 const CRB_CTRL_CANCEL: u32 = 0x48;
 const CRB_CANCEL_INVOKE: u32 = 1 << 0;
 const CRB_CTRL_START: u32 = 0x4C;
@@ -94,7 +165,7 @@ const TPM_CRB_NO_LOCALITY: u32 = 0xff;
 const TPM_CRB_ADDR_BASE: u32 = TPM_START.0 as u32;
 const TPM_CRB_ADDR_SIZE: usize = TPM_SIZE as usize;
 
-const TPM_CRB_R_MAX: u32 = CRB_DATA_BUFFER;
+const TPM_CRB_R_MAX: usize = CRB_DATA_BUFFER as usize;
 
 // CRB Protocol details
 const CRB_INTF_TYPE_CRB_ACTIVE: u32 = 0b1;
@@ -109,47 +180,29 @@ const PCI_VENDOR_ID_IBM: u32 = 0x1014;
 const CRB_CTRL_CMD_SIZE_REG: u32 = 0x58;
 const CRB_CTRL_CMD_SIZE: usize = TPM_CRB_ADDR_SIZE - CRB_DATA_BUFFER as usize;
 
-fn get_fields_map(reg: u32) -> phf::Map<&'static str, [u32; 2]> {
+// Returns (register base, offset, len)
+const fn get_field(reg: CrbRegister) -> (u32, u32, u32) {
     match reg {
-        CRB_LOC_STATE => CRB_LOC_STATE_FIELDS,
-        CRB_LOC_STS => CRB_LOC_STS_FIELDS,
-        CRB_INTF_ID => CRB_INTF_ID_FIELDS,
-        CRB_INTF_ID2 => CRB_INTF_ID2_FIELDS,
-        CRB_CTRL_STS => CRB_CTRL_STS_FIELDS,
-        _ => {
-            panic!("Fields in '{reg:?}' register were accessed which are Invalid");
-        }
+        CrbRegister::LocState(f) => get_crb_loc_state_field(f),
+        CrbRegister::LocSts(f) => get_crb_loc_sts_field(f),
+        CrbRegister::IntfId(f) => get_crb_intf_id_field(f),
+        CrbRegister::IntfId2(f) => get_crb_intf_id2_field(f),
+        CrbRegister::CtrlSts(f) => get_crb_ctrl_sts_field(f),
     }
 }
 
-/// Set a particular field in a Register
-fn set_reg_field(regs: &mut [u32; TPM_CRB_R_MAX as usize], reg: u32, field: &str, value: u32) {
-    let reg_fields = get_fields_map(reg);
-    if reg_fields.contains_key(field) {
-        let start = reg_fields.get(field).unwrap()[0];
-        let len = reg_fields.get(field).unwrap()[1];
-        let mask = (!(0_u32) >> (32 - len)) << start;
-        regs[reg as usize] = (regs[reg as usize] & !mask) | ((value << start) & mask);
-    } else {
-        error!(
-            "Failed to tpm Register. {:?} is not a valid field in Reg {:#X}",
-            field, reg
-        )
-    }
+// Set a particular field in a Register
+fn set_reg_field(regs: &mut [u32; TPM_CRB_R_MAX], reg: CrbRegister, value: u32) {
+    let (base, offset, len) = get_field(reg);
+    let mask = (!(0_u32) >> (32 - len)) << offset;
+    regs[base as usize] = (regs[base as usize] & !mask) | ((value << offset) & mask);
 }
 
-/// Get the value of a particular field in a Register
-fn get_reg_field(regs: &[u32; TPM_CRB_R_MAX as usize], reg: u32, field: &str) -> u32 {
-    let reg_fields = get_fields_map(reg);
-    if reg_fields.contains_key(field) {
-        let start = reg_fields.get(field).unwrap()[0];
-        let len = reg_fields.get(field).unwrap()[1];
-        let mask = (!(0_u32) >> (32 - len)) << start;
-        (regs[reg as usize] & mask) >> start
-    } else {
-        // TODO: Sensible return value if fields do not exist
-        0x0
-    }
+// Get the value of a particular field in a Register
+const fn get_reg_field(regs: &[u32; TPM_CRB_R_MAX], reg: CrbRegister) -> u32 {
+    let (base, offset, len) = get_field(reg);
+    let mask = (!(0_u32) >> (32 - len)) << offset;
+    (regs[base as usize] & mask) >> offset
 }
 
 fn locality_from_addr(addr: u32) -> u8 {
@@ -158,8 +211,7 @@ fn locality_from_addr(addr: u32) -> u8 {
 
 pub struct Tpm {
     emulator: Emulator,
-    cmd: Option<BackendCmd>,
-    regs: [u32; TPM_CRB_R_MAX as usize],
+    regs: [u32; TPM_CRB_R_MAX],
     backend_buff_size: usize,
     data_buff: [u8; TPM_CRB_BUFFER_MAX],
     data_buff_len: usize,
@@ -171,8 +223,7 @@ impl Tpm {
             .map_err(|e| Error::Init(anyhow!("Failed while initializing tpm Emulator: {:?}", e)))?;
         let mut tpm = Tpm {
             emulator,
-            cmd: None,
-            regs: [0; TPM_CRB_R_MAX as usize],
+            regs: [0; TPM_CRB_R_MAX],
             backend_buff_size: TPM_CRB_BUFFER_MAX,
             data_buff: [0; TPM_CRB_BUFFER_MAX],
             data_buff_len: 0,
@@ -182,74 +233,93 @@ impl Tpm {
     }
 
     fn get_active_locality(&mut self) -> u32 {
-        if get_reg_field(&self.regs, CRB_LOC_STATE, "locAssigned") == 0 {
+        if get_reg_field(
+            &self.regs,
+            CrbRegister::LocState(LocStateFields::LocAssigned),
+        ) == 0
+        {
             return TPM_CRB_NO_LOCALITY;
         }
-        get_reg_field(&self.regs, CRB_LOC_STATE, "activeLocality")
+        get_reg_field(
+            &self.regs,
+            CrbRegister::LocState(LocStateFields::ActiveLocality),
+        )
     }
 
-    fn request_completed(&mut self, result: isize) {
+    fn request_completed(&mut self, success: bool) {
         self.regs[CRB_CTRL_START as usize] = !CRB_START_INVOKE;
-        if result != 0 {
-            set_reg_field(&mut self.regs, CRB_CTRL_STS, "tpmSts", 1);
+        if !success {
+            set_reg_field(
+                &mut self.regs,
+                CrbRegister::CtrlSts(CtrlStsFields::TpmSts),
+                1,
+            );
         }
     }
 
     fn reset(&mut self) -> Result<()> {
-        let cur_buff_size = self.emulator.get_buffer_size().unwrap();
-        self.regs = [0; TPM_CRB_R_MAX as usize];
-        set_reg_field(&mut self.regs, CRB_LOC_STATE, "tpmRegValidSts", 1);
-        set_reg_field(&mut self.regs, CRB_CTRL_STS, "tpmIdle", 1);
+        let cur_buff_size = self.emulator.get_buffer_size();
+        self.regs = [0; TPM_CRB_R_MAX];
         set_reg_field(
             &mut self.regs,
-            CRB_INTF_ID,
-            "InterfaceType",
+            CrbRegister::LocState(LocStateFields::TpmRegValidSts),
+            1,
+        );
+        set_reg_field(
+            &mut self.regs,
+            CrbRegister::CtrlSts(CtrlStsFields::TpmIdle),
+            1,
+        );
+        set_reg_field(
+            &mut self.regs,
+            CrbRegister::IntfId(IntfIdFields::InterfaceType),
             CRB_INTF_TYPE_CRB_ACTIVE,
         );
         set_reg_field(
             &mut self.regs,
-            CRB_INTF_ID,
-            "InterfaceVersion",
+            CrbRegister::IntfId(IntfIdFields::InterfaceVersion),
             CRB_INTF_VERSION_CRB,
         );
         set_reg_field(
             &mut self.regs,
-            CRB_INTF_ID,
-            "CapLocality",
+            CrbRegister::IntfId(IntfIdFields::CapLocality),
             CRB_INTF_CAP_LOCALITY_0_ONLY,
         );
         set_reg_field(
             &mut self.regs,
-            CRB_INTF_ID,
-            "CapCRBIdleBypass",
+            CrbRegister::IntfId(IntfIdFields::CapCRBIdleBypass),
             CRB_INTF_CAP_IDLE_FAST,
         );
         set_reg_field(
             &mut self.regs,
-            CRB_INTF_ID,
-            "CapDataXferSizeSupport",
+            CrbRegister::IntfId(IntfIdFields::CapDataXferSizeSupport),
             CRB_INTF_CAP_XFER_SIZE_64,
         );
         set_reg_field(
             &mut self.regs,
-            CRB_INTF_ID,
-            "CapFIFO",
+            CrbRegister::IntfId(IntfIdFields::CapFIFO),
             CRB_INTF_CAP_FIFO_NOT_SUPPORTED,
         );
         set_reg_field(
             &mut self.regs,
-            CRB_INTF_ID,
-            "CapCRB",
+            CrbRegister::IntfId(IntfIdFields::CapCRB),
             CRB_INTF_CAP_CRB_SUPPORTED,
         );
         set_reg_field(
             &mut self.regs,
-            CRB_INTF_ID,
-            "InterfaceSelector",
+            CrbRegister::IntfId(IntfIdFields::InterfaceSelector),
             CRB_INTF_IF_SELECTOR_CRB,
         );
-        set_reg_field(&mut self.regs, CRB_INTF_ID, "RID", 0b0000);
-        set_reg_field(&mut self.regs, CRB_INTF_ID2, "VID", PCI_VENDOR_ID_IBM);
+        set_reg_field(
+            &mut self.regs,
+            CrbRegister::IntfId(IntfIdFields::Rid),
+            0b0000,
+        );
+        set_reg_field(
+            &mut self.regs,
+            CrbRegister::IntfId2(IntfId2Fields::Vid),
+            PCI_VENDOR_ID_IBM,
+        );
 
         self.regs[CRB_CTRL_CMD_SIZE_REG as usize] = CRB_CTRL_CMD_SIZE as u32;
         self.regs[CRB_CTRL_CMD_LADDR as usize] = TPM_CRB_ADDR_BASE + CRB_DATA_BUFFER;
@@ -268,7 +338,6 @@ impl Tpm {
     }
 }
 
-//impl BusDevice for TPM
 impl BusDevice for Tpm {
     fn read(&mut self, _base: u64, offset: u64, data: &mut [u8]) {
         let mut offset: u32 = offset as u32;
@@ -367,10 +436,18 @@ impl BusDevice for Tpm {
                 }
                 CRB_CTRL_REQ => match v {
                     CRB_CTRL_REQ_CMD_READY => {
-                        set_reg_field(&mut self.regs, CRB_CTRL_STS, "tpmIdle", 0);
+                        set_reg_field(
+                            &mut self.regs,
+                            CrbRegister::CtrlSts(CtrlStsFields::TpmIdle),
+                            0,
+                        );
                     }
                     CRB_CTRL_REQ_GO_IDLE => {
-                        set_reg_field(&mut self.regs, CRB_CTRL_STS, "tpmIdle", 1);
+                        set_reg_field(
+                            &mut self.regs,
+                            CrbRegister::CtrlSts(CtrlStsFields::TpmIdle),
+                            1,
+                        );
                     }
                     _ => {
                         error!("Invalid value passed to CRTL_REQ register");
@@ -393,27 +470,14 @@ impl BusDevice for Tpm {
                     {
                         self.regs[CRB_CTRL_START as usize] |= CRB_START_INVOKE;
 
-                        self.cmd = Some(BackendCmd {
-                            locality: locality as u8,
-                            input: self.data_buff[0..self.data_buff_len].to_vec(),
+                        let mut cmd = BackendCmd {
+                            buffer: &mut self.data_buff,
                             input_len: cmp::min(self.data_buff_len, TPM_CRB_BUFFER_MAX),
-                            output: self.data_buff.to_vec(),
-                            output_len: TPM_CRB_BUFFER_MAX,
-                            selftest_done: false,
-                        });
+                        };
 
-                        let mut cmd = self.cmd.as_ref().unwrap().clone();
-                        let output = self.emulator.deliver_request(&mut cmd).map_err(|e| {
-                            Error::DeliverRequest(anyhow!(
-                                "Failed to deliver tpm request. Error :{:?}",
-                                e
-                            ))
-                        });
-                        //TODO: drop the copy here
-                        self.data_buff.fill(0);
-                        self.data_buff.clone_from_slice(output.unwrap().as_slice());
+                        let status = self.emulator.deliver_request(&mut cmd).is_ok();
 
-                        self.request_completed(TPM_SUCCESS as isize);
+                        self.request_completed(status);
                     }
                 }
                 CRB_LOC_CTRL => {
@@ -424,13 +488,33 @@ impl BusDevice for Tpm {
                     match v {
                         CRB_LOC_CTRL_RESET_ESTABLISHMENT_BIT => {}
                         CRB_LOC_CTRL_RELINQUISH => {
-                            set_reg_field(&mut self.regs, CRB_LOC_STATE, "locAssigned", 0);
-                            set_reg_field(&mut self.regs, CRB_LOC_STS, "Granted", 0);
+                            set_reg_field(
+                                &mut self.regs,
+                                CrbRegister::LocState(LocStateFields::LocAssigned),
+                                0,
+                            );
+                            set_reg_field(
+                                &mut self.regs,
+                                CrbRegister::LocSts(LocStsFields::Granted),
+                                0,
+                            );
                         }
                         CRB_LOC_CTRL_REQUEST_ACCESS => {
-                            set_reg_field(&mut self.regs, CRB_LOC_STS, "Granted", 1);
-                            set_reg_field(&mut self.regs, CRB_LOC_STS, "beenSeized", 0);
-                            set_reg_field(&mut self.regs, CRB_LOC_STATE, "locAssigned", 1);
+                            set_reg_field(
+                                &mut self.regs,
+                                CrbRegister::LocSts(LocStsFields::Granted),
+                                1,
+                            );
+                            set_reg_field(
+                                &mut self.regs,
+                                CrbRegister::LocSts(LocStsFields::BeenSeized),
+                                0,
+                            );
+                            set_reg_field(
+                                &mut self.regs,
+                                CrbRegister::LocState(LocStateFields::LocAssigned),
+                                1,
+                            );
                         }
                         _ => {
                             error!("Invalid value to write in CRB_LOC_CTRL {:#X} ", v);
@@ -456,10 +540,10 @@ mod tests {
 
     #[test]
     fn test_set_get_reg_field() {
-        let mut regs: [u32; TPM_CRB_R_MAX as usize] = [0; TPM_CRB_R_MAX as usize];
-        set_reg_field(&mut regs, CRB_INTF_ID, "RID", 0xAC);
+        let mut regs: [u32; TPM_CRB_R_MAX] = [0; TPM_CRB_R_MAX];
+        set_reg_field(&mut regs, CrbRegister::IntfId(IntfIdFields::Rid), 0xAC);
         assert_eq!(
-            get_reg_field(&regs, CRB_INTF_ID, "RID"),
+            get_reg_field(&regs, CrbRegister::IntfId(IntfIdFields::Rid)),
             0xAC,
             concat!("Test: ", stringify!(set_get_reg_field))
         );

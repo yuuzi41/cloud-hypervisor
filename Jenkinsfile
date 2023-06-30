@@ -1,6 +1,9 @@
 def runWorkers = true
 pipeline {
     agent none
+    options {
+        timeout(time: 4, unit: 'HOURS')
+    }
     stages {
         stage('Early checks') {
             agent { node { label 'built-in' } }
@@ -214,7 +217,7 @@ pipeline {
                         stage('Download assets') {
                             steps {
                                 sh "mkdir ${env.HOME}/workloads"
-                                sh 'az storage blob download --container-name private-images --file "$HOME/workloads/windows-server-2019.raw" --name windows-server-2019.raw --connection-string "$AZURE_CONNECTION_STRING"'
+                                sh 'az storage blob download --container-name private-images --file "$HOME/workloads/windows-server-2022-amd64-2.raw" --name windows-server-2022-amd64-2.raw --connection-string "$AZURE_CONNECTION_STRING"'
                             }
                         }
                         stage('Run Windows guest integration tests') {

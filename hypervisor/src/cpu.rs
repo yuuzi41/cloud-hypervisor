@@ -21,6 +21,15 @@ use crate::MpState;
 use thiserror::Error;
 use vm_memory::GuestAddress;
 
+#[cfg(target_arch = "x86_64")]
+#[derive(Copy, Clone, Default)]
+pub enum CpuVendor {
+    #[default]
+    Unknown,
+    Intel,
+    AMD,
+}
+
 #[derive(Error, Debug)]
 ///
 /// Enum for CPU error
@@ -237,6 +246,12 @@ pub enum HypervisorCpuError {
     ///
     #[error("Failed to initialize PMU")]
     InitializePmu,
+    #[cfg(target_arch = "x86_64")]
+    ///
+    /// Error getting TSC frequency
+    ///
+    #[error("Failed to get TSC frequency: {0}")]
+    GetTscKhz(#[source] anyhow::Error),
 }
 
 #[derive(Debug)]
@@ -432,4 +447,11 @@ pub trait Vcpu: Send + Sync {
     /// Return the list of initial MSR entries for a VCPU
     ///
     fn boot_msr_entries(&self) -> Vec<MsrEntry>;
+    #[cfg(target_arch = "x86_64")]
+    ///
+    /// Get the frequency of the TSC if available
+    ///
+    fn tsc_khz(&self) -> Result<Option<u32>> {
+        Ok(None)
+    }
 }

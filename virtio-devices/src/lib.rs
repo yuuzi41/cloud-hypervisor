@@ -39,19 +39,24 @@ pub mod vhost_user;
 pub mod vsock;
 pub mod watchdog;
 
-pub use self::balloon::*;
-pub use self::block::*;
-pub use self::console::*;
-pub use self::device::*;
-pub use self::epoll_helper::*;
-pub use self::iommu::*;
-pub use self::mem::*;
-pub use self::net::*;
-pub use self::pmem::*;
-pub use self::rng::*;
-pub use self::vdpa::*;
-pub use self::vsock::*;
-pub use self::watchdog::*;
+pub use self::balloon::Balloon;
+pub use self::block::{Block, BlockState};
+pub use self::console::{Console, ConsoleResizer, Endpoint};
+pub use self::device::{
+    DmaRemapping, UserspaceMapping, VirtioCommon, VirtioDevice, VirtioInterrupt,
+    VirtioInterruptType, VirtioSharedMemoryList,
+};
+pub use self::epoll_helper::{
+    EpollHelper, EpollHelperError, EpollHelperHandler, EPOLL_HELPER_EVENT_LAST,
+};
+pub use self::iommu::{AccessPlatformMapping, Iommu, IommuMapping};
+pub use self::mem::{BlocksState, Mem, VirtioMemMappingSource, VIRTIO_MEM_ALIGN_SIZE};
+pub use self::net::{Net, NetCtrlEpollHandler};
+pub use self::pmem::Pmem;
+pub use self::rng::Rng;
+pub use self::vdpa::{Vdpa, VdpaDmaMapping};
+pub use self::vsock::Vsock;
+pub use self::watchdog::Watchdog;
 use vm_memory::{bitmap::AtomicBitmap, GuestAddress, GuestMemory};
 use vm_virtio::VirtioDeviceType;
 
@@ -86,8 +91,8 @@ pub enum ActivateError {
     ThreadSpawn(std::io::Error),
     #[error("Failed to setup vhost-user-fs daemon: {0}")]
     VhostUserFsSetup(vhost_user::Error),
-    #[error("Failed to setup vhost-user-blk daemon: {0}")]
-    VhostUserBlkSetup(vhost_user::Error),
+    #[error("Failed to setup vhost-user daemon: {0}")]
+    VhostUserSetup(vhost_user::Error),
     #[error("Failed to create seccomp filter: {0}")]
     CreateSeccompFilter(seccompiler::Error),
     #[error("Failed to create rate limiter: {0}")]

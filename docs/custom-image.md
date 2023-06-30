@@ -88,7 +88,7 @@ Ubuntu distributions.
 
 ```bash
 apt update
-apt install fio iperf iperf3 socat stress cpuid
+apt install fio iperf iperf3 socat stress cpuid tpm2-tools
 ```
 
 ### Remove counterproductive packages
@@ -170,8 +170,8 @@ We usually start from one of the custom cloud image we have previously created
 but we can use a stock cloud image as well.
 
 ```bash
-wget https://cloud-hypervisor.azureedge.net/jammy-server-cloudimg-amd64-custom-20221118-1.raw
-mv jammy-server-cloudimg-amd64-custom-20221118-1.raw jammy-server-cloudimg-amd64-nvidia.raw
+wget https://cloud-hypervisor.azureedge.net/jammy-server-cloudimg-amd64-custom-20230119-0.raw
+mv jammy-server-cloudimg-amd64-custom-20230119-0.raw jammy-server-cloudimg-amd64-nvidia.raw
 ```
 
 ### Extend the image size
@@ -225,7 +225,7 @@ Number  Start   End     Size    File system  Name  Flags
 
 ### Create a macvtap interface
 
-Rely on the following [documentation](docs/macvtap-bridge.md) to set up a
+Rely on the following [documentation](macvtap-bridge.md) to set up a
 macvtap interface to provide your VM with proper connectivity.
 
 ### Boot the image

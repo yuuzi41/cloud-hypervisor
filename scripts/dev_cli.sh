@@ -6,8 +6,8 @@
 
 CLI_NAME="Cloud Hypervisor"
 
-CTR_IMAGE_TAG="cloudhypervisor/dev"
-CTR_IMAGE_VERSION="20230116-0"
+CTR_IMAGE_TAG="ghcr.io/cloud-hypervisor/cloud-hypervisor"
+CTR_IMAGE_VERSION="20230620-0"
 CTR_IMAGE="${CTR_IMAGE_TAG}:${CTR_IMAGE_VERSION}"
 
 DOCKER_RUNTIME="docker"
@@ -168,10 +168,15 @@ process_volumes_args() {
         exported_volumes="$exported_volumes --volume $var"
     done
 }
+
 cmd_help() {
     echo ""
     echo "Cloud Hypervisor $(basename "$0")"
-    echo "Usage: $(basename "$0") <command> [<command args>]"
+    echo "Usage: $(basename "$0") [flags] <command> [<command args>]"
+    echo ""
+    echo "Available flags":
+    echo ""
+    echo "    --local        Set the container image version being used to \"local\"."
     echo ""
     echo "Available commands:"
     echo ""
@@ -379,6 +384,10 @@ cmd_tests() {
         exported_device="/dev/mshv"
     fi
 
+    if [ ! -e "${exported_device}" ] ; then
+        die "${exported_device} does not exist on the system"
+    fi
+
     set -- '--hypervisor' "$hypervisor" "$@"
 
     ensure_build_dir
@@ -417,7 +426,7 @@ cmd_tests() {
             --env USER="root" \
             --env CH_LIBC="${libc}" \
             "$CTR_IMAGE" \
-            ./scripts/run_integration_tests_"$(uname -m)".sh "$@" || fix_dir_perms $? || exit $?
+            dbus-run-session ./scripts/run_integration_tests_"$(uname -m)".sh "$@" || fix_dir_perms $? || exit $?
     fi
 
     if [ "$integration_sgx" = true ]; then
@@ -530,6 +539,7 @@ cmd_tests() {
             --volume "$CLH_INTEGRATION_WORKLOADS:$CTR_CLH_INTEGRATION_WORKLOADS" \
             --env USER="root" \
             --env CH_LIBC="${libc}" \
+            --env RUST_BACKTRACE="${RUST_BACKTRACE}" \
             "$CTR_IMAGE" \
             ./scripts/run_metrics.sh "$@" || fix_dir_perms $? || exit $?
     fi
@@ -620,6 +630,12 @@ cmd_shell() {
 
     fix_dir_perms $?
 }
+
+if [ $# = 0 ]; then
+    cmd_help
+    say_err "Please specify command to run!"
+    exit 1
+fi
 
 # Parse main command line args.
 #

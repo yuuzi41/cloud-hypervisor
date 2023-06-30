@@ -8,7 +8,7 @@ extern crate event_monitor;
 
 use argh::FromArgs;
 use libc::EFD_NONBLOCK;
-use log::LevelFilter;
+use log::{warn, LevelFilter};
 use option_parser::OptionParser;
 use seccompiler::SeccompAction;
 use signal_hook::consts::SIGSYS;
@@ -18,10 +18,11 @@ use std::os::unix::io::{FromRawFd, RawFd};
 use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
 use thiserror::Error;
+#[cfg(feature = "dbus_api")]
+use vmm::api::dbus::{dbus_api_graceful_shutdown, DBusApiOptions};
 use vmm::config;
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::signal::block_signal;
-use vmm_sys_util::terminal::Terminal;
 
 #[cfg(feature = "dhat-heap")]
 #[global_allocator]
@@ -34,6 +35,8 @@ enum Error {
     #[cfg(feature = "guest_debug")]
     #[error("Failed to create Debug EventFd: {0}")]
     CreateDebugEventFd(#[source] std::io::Error),
+    #[error("Failed to create exit EventFd: {0}")]
+    CreateExitEventFd(#[source] std::io::Error),
     #[error("Failed to open hypervisor interface (is hypervisor interface available?): {0}")]
     CreateHypervisor(#[source] hypervisor::HypervisorError),
     #[error("Failed to start the VMM thread: {0}")]
@@ -56,6 +59,12 @@ enum Error {
     ParsingApiSocket(std::num::ParseIntError),
     #[error("Error parsing --event-monitor: {0}")]
     ParsingEventMonitor(option_parser::OptionParserError),
+    #[cfg(feature = "dbus_api")]
+    #[error("`--dbus-object-path` option isn't provided")]
+    MissingDBusObjectPath,
+    #[cfg(feature = "dbus_api")]
+    #[error("`--dbus-service-name` option isn't provided")]
+    MissingDBusServiceName,
     #[error("Error parsing --event-monitor: path or fd required")]
     BareEventMonitor,
     #[error("Error doing event monitor I/O: {0}")]
@@ -91,9 +100,9 @@ impl log::Log for Logger {
         let duration = now.duration_since(self.start);
 
         if record.file().is_some() && record.line().is_some() {
-            writeln!(
+            write!(
                 *(*(self.output.lock().unwrap())),
-                "cloud-hypervisor: {:.6?}: <{}> {}:{}:{} -- {}",
+                "cloud-hypervisor: {:.6?}: <{}> {}:{}:{} -- {}\r\n",
                 duration,
                 std::thread::current().name().unwrap_or("anonymous"),
                 record.level(),
@@ -102,9 +111,9 @@ impl log::Log for Logger {
                 record.args()
             )
         } else {
-            writeln!(
+            write!(
                 *(*(self.output.lock().unwrap())),
-                "cloud-hypervisor: {:.6?}: <{}> {}:{} -- {}",
+                "cloud-hypervisor: {:.6?}: <{}> {}:{} -- {}\r\n",
                 duration,
                 std::thread::current().name().unwrap_or("anonymous"),
                 record.level(),
@@ -137,19 +146,19 @@ fn default_rng() -> String {
 /// Launch a cloud-hypervisor VMM.
 pub struct TopLevel {
     #[argh(option, long = "cpus", default = "default_vcpus()")]
-    /// boot=<boot_vcpus>,max=<max_vcpus>,topology=<threads_per_core>:<cores_per_die>:<dies_per_package>:<packages>,kvm_hyperv=on|off,max_phys_bits=<maximum_number_of_physical_bits>,affinity=<list_of_vcpus_with_their_associated_cpuset>,features=<list_of_features_to_enable>
+    /// boot=<boot_vcpus>, max=<max_vcpus>, topology=<threads_per_core>:<cores_per_die>:<dies_per_package>:<packages>, kvm_hyperv=on|off, max_phys_bits=<maximum_number_of_physical_bits>, affinity=<list_of_vcpus_with_their_associated_cpuset>, features=<list_of_features_to_enable>
     cpus: String,
 
     #[argh(option, long = "platform")]
-    /// num_pci_segments=<num_pci_segments>,iommu_segments=<list_of_segments>,serial_number=<dmi_device_serial_number>,uuid=<dmi_device_uuid>,oem_strings=<list_of_strings>
+    /// num_pci_segments=<num_pci_segments>, iommu_segments=<list_of_segments>, serial_number=<dmi_device_serial_number>, uuid=<dmi_device_uuid>, oem_strings=<list_of_strings>
     platform: Option<String>,
 
     #[argh(option, long = "memory", default = "default_memory()")]
-    /// size=<guest_memory_size>,mergeable=on|off,shared=on|off,hugepages=on|off,hugepage_size=<hugepage_size>,hotplug_method=acpi|virtio-mem,hotplug_size=<hotpluggable_memory_size>,hotplugged_size=<hotplugged_memory_size>,prefault=on|off,thp=on|off
+    /// size=<guest_memory_size>, mergeable=on|off, shared=on|off, hugepages=on|off, hugepage_size=<hugepage_size>, hotplug_method=acpi|virtio-mem, hotplug_size=<hotpluggable_memory_size>, hotplugged_size=<hotplugged_memory_size>, prefault=on|off, thp=on|off
     memory: String,
 
     #[argh(option, long = "memory-zone")]
-    /// size=<guest_memory_region_size>,file=<backing_file>,shared=on|off,hugepages=on|off,hugepage_size=<hugepage_size>,host_numa_node=<node_id>,id=<zone_identifier>,hotplug_size=<hotpluggable_memory_size>,hotplugged_size=<hotplugged_memory_size>,prefault=on|off
+    /// size=<guest_memory_region_size>, file=<backing_file>, shared=on|off, hugepages=on|off, hugepage_size=<hugepage_size>, host_numa_node=<node_id>, id=<zone_identifier>, hotplug_size=<hotpluggable_memory_size>, hotplugged_size=<hotplugged_memory_size>, prefault=on|off
     memory_zone: Vec<String>,
 
     #[argh(option, long = "firmware")]
@@ -169,27 +178,27 @@ pub struct TopLevel {
     cmdline: Option<String>,
 
     #[argh(option, long = "disk")]
-    /// path=<disk_image_path>,readonly=on|off,direct=on|off,iommu=on|off,num_queues=<number_of_queues>,queue_size=<size_of_each_queue>,vhost_user=on|off,socket=<vhost_user_socket_path>,bw_size=<bytes>,bw_one_time_burst=<bytes>,bw_refill_time=<ms>,ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,id=<device_id>,pci_segment=<segment_id>
+    /// path=<disk_image_path>, readonly=on|off, direct=on|off, iommu=on|off, num_queues=<number_of_queues>, queue_size=<size_of_each_queue>, vhost_user=on|off, socket=<vhost_user_socket_path>, bw_size=<bytes>, bw_one_time_burst=<bytes>, bw_refill_time=<ms>, ops_size=<io_ops>, ops_one_time_burst=<io_ops>, ops_refill_time=<ms>, id=<device_id>, pci_segment=<segment_id>
     disk: Vec<String>,
 
     #[argh(option, long = "net")]
-    /// tap=<if_name>,ip=<ip_addr>,mask=<net_mask>,mac=<mac_addr>,fd=<fd1,fd2...>,iommu=on|off,num_queues=<number_of_queues>,queue_size=<size_of_each_queue>,id=<device_id>,vhost_user=<vhost_user_enable>,socket=<vhost_user_socket_path>,vhost_mode=client|server,bw_size=<bytes>,bw_one_time_burst=<bytes>,bw_refill_time=<ms>,ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,pci_segment=<segment_id>offload_tso=on|off,offload_ufo=on|off,offload_csum=on|off
+    /// tap=<if_name>, ip=<ip_addr>, mask=<net_mask>, mac=<mac_addr>, fd=<fd1,fd2...>, iommu=on|off, num_queues=<number_of_queues>, queue_size=<size_of_each_queue>, id=<device_id>, vhost_user=<vhost_user_enable>, socket=<vhost_user_socket_path>, vhost_mode=client|server, bw_size=<bytes>, bw_one_time_burst=<bytes>, bw_refill_time=<ms>, ops_size=<io_ops>, ops_one_time_burst=<io_ops>, ops_refill_time=<ms>, pci_segment=<segment_id>offload_tso=on|off, offload_ufo=on|off, offload_csum=on|off
     net: Vec<String>,
 
     #[argh(option, long = "rng", default = "default_rng()")]
-    /// src=<entropy_source_path>,iommu=on|off
+    /// src=<entropy_source_path>, iommu=on|off
     rng: String,
 
     #[argh(option, long = "balloon")]
-    /// size=<balloon_size>,deflate_on_oom=on|off,free_page_reporting=on|off
+    /// size=<balloon_size>, deflate_on_oom=on|off, free_page_reporting=on|off
     balloon: Option<String>,
 
     #[argh(option, long = "fs")]
-    /// tag=<tag_name>,socket=<socket_path>,num_queues=<number_of_queues>,queue_size=<size_of_each_queue>,id=<device_id>,pci_segment=<segment_id>
+    /// tag=<tag_name>, socket=<socket_path>, num_queues=<number_of_queues>, queue_size=<size_of_each_queue>, id=<device_id>, pci_segment=<segment_id>
     fs: Vec<String>,
 
     #[argh(option, long = "pmem")]
-    /// file=<backing_file_path>,size=<persistent_memory_size>,iommu=on|off,discard_writes=on|off,id=<device_id>,pci_segment=<segment_id>
+    /// file=<backing_file_path>, size=<persistent_memory_size>, iommu=on|off, discard_writes=on|off, id=<device_id>, pci_segment=<segment_id>
     pmem: Vec<String>,
 
     #[argh(option, long = "serial", default = "String::from(\"null\")")]
@@ -197,27 +206,27 @@ pub struct TopLevel {
     serial: String,
 
     #[argh(option, long = "console", default = "String::from(\"tty\")")]
-    /// off|null|pty|tty|file=/path/to/a/file,iommu=on|off
+    /// off|null|pty|tty|file=/path/to/a/file, iommu=on|off
     console: String,
 
     #[argh(option, long = "device")]
-    /// path=<device_path>,iommu=on|off,id=<device_id>,pci_segment=<segment_id>
+    /// path=<device_path>, iommu=on|off, id=<device_id>, pci_segment=<segment_id>
     device: Vec<String>,
 
     #[argh(option, long = "user-device")]
-    /// socket=<socket_path>,id=<device_id>,pci_segment=<segment_id>
+    /// socket=<socket_path>, id=<device_id>, pci_segment=<segment_id>
     user_device: Vec<String>,
 
     #[argh(option, long = "vdpa")]
-    /// path=<device_path>,num_queues=<number_of_queues>,iommu=on|off,id=<device_id>,pci_segment=<segment_id>
+    /// path=<device_path>, num_queues=<number_of_queues>, iommu=on|off, id=<device_id>, pci_segment=<segment_id>
     vdpa: Vec<String>,
 
     #[argh(option, long = "vsock")]
-    /// cid=<context_id>,socket=<socket_path>,iommu=on|off,id=<device_id>,pci_segment=<segment_id>
+    /// cid=<context_id>, socket=<socket_path>, iommu=on|off, id=<device_id>, pci_segment=<segment_id>
     vsock: Option<String>,
 
     #[argh(option, long = "numa")]
-    /// guest_numa_id=<node_id>,cpus=<cpus_id>,distances=<list_of_distances_to_destination_nodes>,memory_zones=<list_of_memory_zones>,sgx_epc_sections=<list_of_sgx_epc_sections>
+    /// guest_numa_id=<node_id>, cpus=<cpus_id>, distances=<list_of_distances_to_destination_nodes>, memory_zones=<list_of_memory_zones>, sgx_epc_sections=<list_of_sgx_epc_sections>
     numa: Vec<String>,
 
     #[argh(switch, long = "watchdog")]
@@ -236,12 +245,27 @@ pub struct TopLevel {
     /// path=<path/to/a/file>|fd=<fd>
     api_socket: Option<String>,
 
+    #[cfg(feature = "dbus_api")]
+    #[argh(option, long = "dbus-service-name")]
+    /// well known name of the service
+    dbus_name: Option<String>,
+
+    #[cfg(feature = "dbus_api")]
+    #[argh(option, long = "dbus-object-path")]
+    /// object path to serve the dbus interface
+    dbus_path: Option<String>,
+
+    #[cfg(feature = "dbus_api")]
+    #[argh(switch, long = "dbus-system-bus")]
+    /// use the system bus instead of a session bus
+    dbus_system_bus: bool,
+
     #[argh(option, long = "event-monitor")]
     /// path=<path/to/a/file>|fd=<fd>
     event_monitor: Option<String>,
 
     #[argh(option, long = "restore")]
-    /// source_url=<source_url>,prefault=on|off
+    /// source_url=<source_url>, prefault=on|off
     restore: Option<String>,
 
     #[argh(option, long = "seccomp", default = "String::from(\"true\")")]
@@ -254,7 +278,7 @@ pub struct TopLevel {
 
     #[cfg(target_arch = "x86_64")]
     #[argh(option, long = "sgx-epc")]
-    /// id=<epc_section_identifier>,size=<epc_section_size>,prefault=on|off
+    /// id=<epc_section_identifier>, size=<epc_section_size>, prefault=on|off
     sgx_epc: Vec<String>,
 
     #[cfg(feature = "guest_debug")]
@@ -415,6 +439,18 @@ fn start_vmm(toplevel: TopLevel) -> Result<Option<String>, Error> {
         (None, None)
     };
 
+    #[cfg(feature = "dbus_api")]
+    let dbus_options = match (&toplevel.dbus_name, &toplevel.dbus_path) {
+        (Some(ref name), Some(ref path)) => Ok(Some(DBusApiOptions {
+            service_name: name.to_owned(),
+            object_path: path.to_owned(),
+            system_bus: toplevel.dbus_system_bus,
+        })),
+        (Some(_), None) => Err(Error::MissingDBusObjectPath),
+        (None, Some(_)) => Err(Error::MissingDBusServiceName),
+        (None, None) => Ok(None),
+    }?;
+
     if let Some(ref monitor_config) = toplevel.event_monitor {
         let mut parser = OptionParser::new();
         parser.add("path").add("fd");
@@ -444,7 +480,7 @@ fn start_vmm(toplevel: TopLevel) -> Result<Option<String>, Error> {
     let (api_request_sender, api_request_receiver) = channel();
     let api_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::CreateApiEventFd)?;
 
-    let http_sender = api_request_sender.clone();
+    let api_request_sender_clone = api_request_sender.clone();
     let seccomp_action = match &toplevel.seccomp as &str {
         "true" => SeccompAction::Trap,
         "false" => SeccompAction::Allow,
@@ -510,12 +546,16 @@ fn start_vmm(toplevel: TopLevel) -> Result<Option<String>, Error> {
     #[cfg(feature = "guest_debug")]
     let vm_debug_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::CreateDebugEventFd)?;
 
-    let vmm_thread = vmm::start_vmm_thread(
-        env!("CARGO_PKG_VERSION").to_string(),
+    let exit_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::CreateExitEventFd)?;
+
+    let vmm_thread_handle = vmm::start_vmm_thread(
+        vmm::VmmVersionInfo::new(env!("BUILD_VERSION"), env!("CARGO_PKG_VERSION")),
         &api_socket_path,
         api_socket_fd,
+        #[cfg(feature = "dbus_api")]
+        dbus_options,
         api_evt.try_clone().unwrap(),
-        http_sender,
+        api_request_sender_clone,
         api_request_receiver,
         #[cfg(feature = "guest_debug")]
         gdb_socket_path,
@@ -523,41 +563,60 @@ fn start_vmm(toplevel: TopLevel) -> Result<Option<String>, Error> {
         debug_evt.try_clone().unwrap(),
         #[cfg(feature = "guest_debug")]
         vm_debug_evt.try_clone().unwrap(),
+        exit_evt.try_clone().unwrap(),
         &seccomp_action,
         hypervisor,
     )
     .map_err(Error::StartVmmThread)?;
 
-    let payload_present = toplevel.kernel.is_some() || toplevel.firmware.is_some();
+    let r: Result<(), Error> = (|| {
+        let payload_present = toplevel.kernel.is_some() || toplevel.firmware.is_some();
 
-    if payload_present {
-        let vm_params = toplevel.to_vm_params();
-        let vm_config = config::VmConfig::parse(vm_params).map_err(Error::ParsingConfig)?;
+        if payload_present {
+            let vm_params = toplevel.to_vm_params();
+            let vm_config = config::VmConfig::parse(vm_params).map_err(Error::ParsingConfig)?;
 
-        // Create and boot the VM based off the VM config we just built.
-        let sender = api_request_sender.clone();
-        vmm::api::vm_create(
-            api_evt.try_clone().unwrap(),
-            api_request_sender,
-            Arc::new(Mutex::new(vm_config)),
-        )
-        .map_err(Error::VmCreate)?;
-        vmm::api::vm_boot(api_evt.try_clone().unwrap(), sender).map_err(Error::VmBoot)?;
-    } else if let Some(restore_params) = toplevel.restore {
-        vmm::api::vm_restore(
-            api_evt.try_clone().unwrap(),
-            api_request_sender,
-            Arc::new(config::RestoreConfig::parse(&restore_params).map_err(Error::ParsingRestore)?),
-        )
-        .map_err(Error::VmRestore)?;
+            // Create and boot the VM based off the VM config we just built.
+            let sender = api_request_sender.clone();
+            vmm::api::vm_create(
+                api_evt.try_clone().unwrap(),
+                api_request_sender,
+                Arc::new(Mutex::new(vm_config)),
+            )
+            .map_err(Error::VmCreate)?;
+            vmm::api::vm_boot(api_evt.try_clone().unwrap(), sender).map_err(Error::VmBoot)?;
+        } else if let Some(restore_params) = toplevel.restore {
+            vmm::api::vm_restore(
+                api_evt.try_clone().unwrap(),
+                api_request_sender,
+                Arc::new(
+                    config::RestoreConfig::parse(&restore_params).map_err(Error::ParsingRestore)?,
+                ),
+            )
+            .map_err(Error::VmRestore)?;
+        }
+
+        Ok(())
+    })();
+
+    if r.is_err() {
+        if let Err(e) = exit_evt.write(1) {
+            warn!("writing to exit EventFd: {e}");
+        }
     }
 
-    vmm_thread
+    vmm_thread_handle
+        .thread_handle
         .join()
         .map_err(Error::ThreadJoin)?
         .map_err(Error::VmmThread)?;
 
-    Ok(api_socket_path)
+    #[cfg(feature = "dbus_api")]
+    if let Some(chs) = vmm_thread_handle.dbus_shutdown_chs {
+        dbus_api_graceful_shutdown(chs);
+    }
+
+    r.map(|_| api_socket_path)
 }
 
 fn main() {
@@ -571,7 +630,7 @@ fn main() {
     let toplevel: TopLevel = argh::from_env();
 
     if toplevel.version {
-        println!("{} {}", env!("CARGO_BIN_NAME"), env!("BUILT_VERSION"));
+        println!("{} {}", env!("CARGO_BIN_NAME"), env!("BUILD_VERSION"));
         return;
     }
 
@@ -585,14 +644,6 @@ fn main() {
             1
         }
     };
-
-    // SAFETY: trivially safe
-    let on_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } != 0;
-    if on_tty {
-        // Don't forget to set the terminal in canonical mode
-        // before to exit.
-        std::io::stdin().lock().set_canon_mode().unwrap();
-    }
 
     #[cfg(feature = "dhat-heap")]
     drop(_profiler);
@@ -731,6 +782,7 @@ mod unit_tests {
             gdb: false,
             platform: None,
             tpm: None,
+            preserved_fds: None,
         };
 
         assert_eq!(expected_vm_config, result_vm_config);

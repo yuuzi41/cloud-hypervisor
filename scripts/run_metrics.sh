@@ -95,7 +95,9 @@ fi
 cargo build --no-default-features --features "kvm,mshv" --all --release --target $BUILD_TARGET
 
 # setup hugepages
-echo 6144 | sudo tee /proc/sys/vm/nr_hugepages
+HUGEPAGESIZE=`grep Hugepagesize /proc/meminfo | awk '{print $2}'`
+PAGE_NUM=`echo $((12288 * 1024 / $HUGEPAGESIZE))`
+echo $PAGE_NUM | sudo tee /proc/sys/vm/nr_hugepages
 sudo chmod a+rwX /dev/hugepages
 
 if [ -n "$test_filter" ]; then
@@ -105,7 +107,12 @@ fi
 # Ensure that git commands can be run in this directory (for metrics report)
 git config --global --add safe.directory $PWD
 
-export RUST_BACKTRACE=1
+RUST_BACKTRACE_VALUE=`echo $RUST_BACKTRACE`
+if [ -z $RUST_BACKTRACE_VALUE ];then
+	export RUST_BACKTRACE=1
+else
+	echo "RUST_BACKTRACE is set to: $RUST_BACKTRACE_VALUE"
+fi
 time target/$BUILD_TARGET/release/performance-metrics ${test_binary_args[*]}
 RES=$?
 

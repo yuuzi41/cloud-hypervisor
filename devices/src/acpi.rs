@@ -4,7 +4,7 @@
 //
 
 use super::AcpiNotificationFlags;
-use acpi_tables::{aml, aml::Aml};
+use acpi_tables::{aml, Aml, AmlSink};
 use std::sync::{Arc, Barrier};
 use std::time::Instant;
 use vm_device::interrupt::InterruptSourceGroup;
@@ -103,11 +103,11 @@ impl BusDevice for AcpiGedDevice {
 }
 
 impl Aml for AcpiGedDevice {
-    fn append_aml_bytes(&self, bytes: &mut Vec<u8>) {
+    fn to_aml_bytes(&self, sink: &mut dyn AmlSink) {
         aml::Device::new(
             "_SB_.GEC_".into(),
             vec![
-                &aml::Name::new("_HID".into(), &aml::EisaName::new("PNP0A06")),
+                &aml::Name::new("_HID".into(), &aml::EISAName::new("PNP0A06")),
                 &aml::Name::new("_UID".into(), &"Generic Event Controller"),
                 &aml::Name::new(
                     "_CRS".into(),
@@ -116,17 +116,19 @@ impl Aml for AcpiGedDevice {
                         true,
                         self.address.0,
                         self.address.0 + GED_DEVICE_ACPI_SIZE as u64 - 1,
+                        None,
                     )]),
                 ),
                 &aml::OpRegion::new(
                     "GDST".into(),
                     aml::OpRegionSpace::SystemMemory,
-                    self.address.0 as usize,
-                    GED_DEVICE_ACPI_SIZE,
+                    &(self.address.0 as usize),
+                    &GED_DEVICE_ACPI_SIZE,
                 ),
                 &aml::Field::new(
                     "GDST".into(),
                     aml::FieldAccessType::Byte,
+                    aml::FieldLockRule::NoLock,
                     aml::FieldUpdateRule::WriteAsZeroes,
                     vec![aml::FieldEntry::Named(*b"GDAT", 8)],
                 ),
@@ -163,7 +165,7 @@ impl Aml for AcpiGedDevice {
                 ),
             ],
         )
-        .append_aml_bytes(bytes);
+        .to_aml_bytes(sink);
         aml::Device::new(
             "_SB_.GED_".into(),
             vec![
@@ -187,7 +189,7 @@ impl Aml for AcpiGedDevice {
                 ),
             ],
         )
-        .append_aml_bytes(bytes)
+        .to_aml_bytes(sink)
     }
 }
 

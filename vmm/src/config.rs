@@ -17,7 +17,7 @@ use std::str::FromStr;
 use thiserror::Error;
 use virtio_devices::{RateLimiterConfig, TokenBucketConfig};
 
-const MAX_NUM_PCI_SEGMENTS: u16 = 16;
+const MAX_NUM_PCI_SEGMENTS: u16 = 96;
 
 /// Errors associated with VM configuration parameters.
 #[derive(Debug, Error)]
@@ -1010,27 +1010,27 @@ impl NetConfig {
             .unwrap_or_default();
         let bw_size = parser
             .convert("bw_size")
-            .map_err(Error::ParseDisk)?
+            .map_err(Error::ParseNetwork)?
             .unwrap_or_default();
         let bw_one_time_burst = parser
             .convert("bw_one_time_burst")
-            .map_err(Error::ParseDisk)?
+            .map_err(Error::ParseNetwork)?
             .unwrap_or_default();
         let bw_refill_time = parser
             .convert("bw_refill_time")
-            .map_err(Error::ParseDisk)?
+            .map_err(Error::ParseNetwork)?
             .unwrap_or_default();
         let ops_size = parser
             .convert("ops_size")
-            .map_err(Error::ParseDisk)?
+            .map_err(Error::ParseNetwork)?
             .unwrap_or_default();
         let ops_one_time_burst = parser
             .convert("ops_one_time_burst")
-            .map_err(Error::ParseDisk)?
+            .map_err(Error::ParseNetwork)?
             .unwrap_or_default();
         let ops_refill_time = parser
             .convert("ops_refill_time")
-            .map_err(Error::ParseDisk)?
+            .map_err(Error::ParseNetwork)?
             .unwrap_or_default();
         let bw_tb_config = if bw_size != 0 && bw_refill_time != 0 {
             Some(TokenBucketConfig {
@@ -2093,9 +2093,25 @@ impl VmConfig {
             gdb,
             platform,
             tpm,
+            preserved_fds: None,
         };
         config.validate().map_err(Error::Validation)?;
         Ok(config)
+    }
+
+    /// # Safety
+    /// To use this safely, the caller must guarantee that the input
+    /// fds are all valid.
+    pub unsafe fn add_preserved_fds(&mut self, mut fds: Vec<i32>) {
+        if fds.is_empty() {
+            return;
+        }
+
+        if let Some(preserved_fds) = &self.preserved_fds {
+            fds.append(&mut preserved_fds.clone());
+        }
+
+        self.preserved_fds = Some(fds);
     }
 
     #[cfg(feature = "tdx")]
@@ -2104,10 +2120,56 @@ impl VmConfig {
     }
 }
 
+impl Clone for VmConfig {
+    fn clone(&self) -> Self {
+        VmConfig {
+            cpus: self.cpus.clone(),
+            memory: self.memory.clone(),
+            payload: self.payload.clone(),
+            disks: self.disks.clone(),
+            net: self.net.clone(),
+            rng: self.rng.clone(),
+            balloon: self.balloon.clone(),
+            fs: self.fs.clone(),
+            pmem: self.pmem.clone(),
+            serial: self.serial.clone(),
+            console: self.console.clone(),
+            devices: self.devices.clone(),
+            user_devices: self.user_devices.clone(),
+            vdpa: self.vdpa.clone(),
+            vsock: self.vsock.clone(),
+            #[cfg(target_arch = "x86_64")]
+            sgx_epc: self.sgx_epc.clone(),
+            numa: self.numa.clone(),
+            platform: self.platform.clone(),
+            tpm: self.tpm.clone(),
+            preserved_fds: self
+                .preserved_fds
+                .as_ref()
+                // SAFETY: FFI call with valid FDs
+                .map(|fds| fds.iter().map(|fd| unsafe { libc::dup(*fd) }).collect()),
+            ..*self
+        }
+    }
+}
+
+impl Drop for VmConfig {
+    fn drop(&mut self) {
+        if let Some(mut fds) = self.preserved_fds.take() {
+            for fd in fds.drain(..) {
+                // SAFETY: FFI call with valid FDs
+                unsafe { libc::close(fd) };
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use net_util::MacAddr;
+    use std::fs::File;
+    use std::os::unix::io::AsRawFd;
 
     #[test]
     fn test_cpu_parsing() -> Result<()> {
@@ -2714,6 +2776,7 @@ mod tests {
             gdb: false,
             platform: None,
             tpm: None,
+            preserved_fds: None,
         };
 
         assert!(valid_config.validate().is_ok());
@@ -2884,24 +2947,26 @@ mod tests {
 
         let mut still_valid_config = valid_config.clone();
         still_valid_config.platform = Some(PlatformConfig {
-            num_pci_segments: 16,
+            num_pci_segments: MAX_NUM_PCI_SEGMENTS,
             ..Default::default()
         });
         assert!(still_valid_config.validate().is_ok());
 
         let mut invalid_config = valid_config.clone();
         invalid_config.platform = Some(PlatformConfig {
-            num_pci_segments: 17,
+            num_pci_segments: MAX_NUM_PCI_SEGMENTS + 1,
             ..Default::default()
         });
         assert_eq!(
             invalid_config.validate(),
-            Err(ValidationError::InvalidNumPciSegments(17))
+            Err(ValidationError::InvalidNumPciSegments(
+                MAX_NUM_PCI_SEGMENTS + 1
+            ))
         );
 
         let mut still_valid_config = valid_config.clone();
         still_valid_config.platform = Some(PlatformConfig {
-            num_pci_segments: 16,
+            num_pci_segments: MAX_NUM_PCI_SEGMENTS,
             iommu_segments: Some(vec![1, 2, 3]),
             ..Default::default()
         });
@@ -2909,18 +2974,18 @@ mod tests {
 
         let mut invalid_config = valid_config.clone();
         invalid_config.platform = Some(PlatformConfig {
-            num_pci_segments: 16,
-            iommu_segments: Some(vec![17, 18]),
+            num_pci_segments: MAX_NUM_PCI_SEGMENTS,
+            iommu_segments: Some(vec![MAX_NUM_PCI_SEGMENTS + 1, MAX_NUM_PCI_SEGMENTS + 2]),
             ..Default::default()
         });
         assert_eq!(
             invalid_config.validate(),
-            Err(ValidationError::InvalidPciSegment(17))
+            Err(ValidationError::InvalidPciSegment(MAX_NUM_PCI_SEGMENTS + 1))
         );
 
         let mut still_valid_config = valid_config.clone();
         still_valid_config.platform = Some(PlatformConfig {
-            num_pci_segments: 16,
+            num_pci_segments: MAX_NUM_PCI_SEGMENTS,
             iommu_segments: Some(vec![1, 2, 3]),
             ..Default::default()
         });
@@ -2933,7 +2998,7 @@ mod tests {
 
         let mut still_valid_config = valid_config.clone();
         still_valid_config.platform = Some(PlatformConfig {
-            num_pci_segments: 16,
+            num_pci_segments: MAX_NUM_PCI_SEGMENTS,
             iommu_segments: Some(vec![1, 2, 3]),
             ..Default::default()
         });
@@ -2946,7 +3011,7 @@ mod tests {
 
         let mut still_valid_config = valid_config.clone();
         still_valid_config.platform = Some(PlatformConfig {
-            num_pci_segments: 16,
+            num_pci_segments: MAX_NUM_PCI_SEGMENTS,
             iommu_segments: Some(vec![1, 2, 3]),
             ..Default::default()
         });
@@ -2959,7 +3024,7 @@ mod tests {
 
         let mut still_valid_config = valid_config.clone();
         still_valid_config.platform = Some(PlatformConfig {
-            num_pci_segments: 16,
+            num_pci_segments: MAX_NUM_PCI_SEGMENTS,
             iommu_segments: Some(vec![1, 2, 3]),
             ..Default::default()
         });
@@ -2972,7 +3037,7 @@ mod tests {
 
         let mut still_valid_config = valid_config.clone();
         still_valid_config.platform = Some(PlatformConfig {
-            num_pci_segments: 16,
+            num_pci_segments: MAX_NUM_PCI_SEGMENTS,
             iommu_segments: Some(vec![1, 2, 3]),
             ..Default::default()
         });
@@ -2985,7 +3050,7 @@ mod tests {
 
         let mut invalid_config = valid_config.clone();
         invalid_config.platform = Some(PlatformConfig {
-            num_pci_segments: 16,
+            num_pci_segments: MAX_NUM_PCI_SEGMENTS,
             iommu_segments: Some(vec![1, 2, 3]),
             ..Default::default()
         });
@@ -3001,7 +3066,7 @@ mod tests {
 
         let mut invalid_config = valid_config.clone();
         invalid_config.platform = Some(PlatformConfig {
-            num_pci_segments: 16,
+            num_pci_segments: MAX_NUM_PCI_SEGMENTS,
             iommu_segments: Some(vec![1, 2, 3]),
             ..Default::default()
         });
@@ -3017,7 +3082,7 @@ mod tests {
 
         let mut invalid_config = valid_config.clone();
         invalid_config.platform = Some(PlatformConfig {
-            num_pci_segments: 16,
+            num_pci_segments: MAX_NUM_PCI_SEGMENTS,
             iommu_segments: Some(vec![1, 2, 3]),
             ..Default::default()
         });
@@ -3033,7 +3098,7 @@ mod tests {
 
         let mut invalid_config = valid_config.clone();
         invalid_config.platform = Some(PlatformConfig {
-            num_pci_segments: 16,
+            num_pci_segments: MAX_NUM_PCI_SEGMENTS,
             iommu_segments: Some(vec![1, 2, 3]),
             ..Default::default()
         });
@@ -3049,7 +3114,7 @@ mod tests {
 
         let mut invalid_config = valid_config.clone();
         invalid_config.platform = Some(PlatformConfig {
-            num_pci_segments: 16,
+            num_pci_segments: MAX_NUM_PCI_SEGMENTS,
             iommu_segments: Some(vec![1, 2, 3]),
             ..Default::default()
         });
@@ -3066,7 +3131,7 @@ mod tests {
         let mut invalid_config = valid_config.clone();
         invalid_config.memory.shared = true;
         invalid_config.platform = Some(PlatformConfig {
-            num_pci_segments: 16,
+            num_pci_segments: MAX_NUM_PCI_SEGMENTS,
             iommu_segments: Some(vec![1, 2, 3]),
             ..Default::default()
         });
@@ -3081,7 +3146,7 @@ mod tests {
 
         let mut invalid_config = valid_config.clone();
         invalid_config.platform = Some(PlatformConfig {
-            num_pci_segments: 16,
+            num_pci_segments: MAX_NUM_PCI_SEGMENTS,
             iommu_segments: Some(vec![1, 2, 3]),
             ..Default::default()
         });
@@ -3097,7 +3162,7 @@ mod tests {
         let mut invalid_config = valid_config.clone();
         invalid_config.memory.shared = true;
         invalid_config.platform = Some(PlatformConfig {
-            num_pci_segments: 16,
+            num_pci_segments: MAX_NUM_PCI_SEGMENTS,
             iommu_segments: Some(vec![1, 2, 3]),
             ..Default::default()
         });
@@ -3123,7 +3188,7 @@ mod tests {
         ]);
         assert!(still_valid_config.validate().is_ok());
 
-        let mut invalid_config = valid_config;
+        let mut invalid_config = valid_config.clone();
         invalid_config.devices = Some(vec![
             DeviceConfig {
                 path: "/device1".into(),
@@ -3135,5 +3200,16 @@ mod tests {
             },
         ]);
         assert!(invalid_config.validate().is_err());
+
+        let mut still_valid_config = valid_config;
+        // SAFETY: Safe as the file was just opened
+        let fd1 = unsafe { libc::dup(File::open("/dev/null").unwrap().as_raw_fd()) };
+        // SAFETY: Safe as the file was just opened
+        let fd2 = unsafe { libc::dup(File::open("/dev/null").unwrap().as_raw_fd()) };
+        // SAFETY: safe as both FDs are valid
+        unsafe {
+            still_valid_config.add_preserved_fds(vec![fd1, fd2]);
+        }
+        let _still_valid_config = still_valid_config.clone();
     }
 }

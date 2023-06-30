@@ -195,13 +195,16 @@ impl MshvHypervisor {
     }
 }
 /// Implementation of Hypervisor trait for Mshv
-/// Example:
-/// #[cfg(feature = "mshv")]
-/// extern crate hypervisor
-/// let mshv = hypervisor::mshv::MshvHypervisor::new().unwrap();
-/// let hypervisor: Arc<dyn hypervisor::Hypervisor> = Arc::new(mshv);
-/// let vm = hypervisor.create_vm().expect("new VM fd creation failed");
 ///
+/// # Examples
+///
+/// ```
+/// # use hypervisor::mshv::MshvHypervisor;
+/// # use std::sync::Arc;
+/// let mshv = MshvHypervisor::new().unwrap();
+/// let hypervisor = Arc::new(mshv);
+/// let vm = hypervisor.create_vm().expect("new VM fd creation failed");
+/// ```
 impl hypervisor::Hypervisor for MshvHypervisor {
     ///
     /// Returns the type of the hypervisor
@@ -210,13 +213,16 @@ impl hypervisor::Hypervisor for MshvHypervisor {
         HypervisorType::Mshv
     }
     /// Create a mshv vm object and return the object as Vm trait object
-    /// Example
-    /// # extern crate hypervisor;
-    /// # use hypervisor::MshvHypervisor;
-    /// use hypervisor::MshvVm;
-    /// let hypervisor = MshvHypervisor::new().unwrap();
-    /// let vm = hypervisor.create_vm().unwrap()
     ///
+    /// # Examples
+    ///
+    /// ```
+    /// # extern crate hypervisor;
+    /// # use hypervisor::mshv::MshvHypervisor;
+    /// use hypervisor::mshv::MshvVm;
+    /// let hypervisor = MshvHypervisor::new().unwrap();
+    /// let vm = hypervisor.create_vm().unwrap();
+    /// ```
     fn create_vm(&self) -> hypervisor::Result<Arc<dyn vm::Vm>> {
         let fd: VmFd;
         loop {
@@ -270,8 +276,15 @@ impl hypervisor::Hypervisor for MshvHypervisor {
     ///
     /// Get the supported CpuID
     ///
-    fn get_cpuid(&self) -> hypervisor::Result<Vec<CpuIdEntry>> {
+    fn get_supported_cpuid(&self) -> hypervisor::Result<Vec<CpuIdEntry>> {
         Ok(Vec::new())
+    }
+
+    /// Get maximum number of vCPUs
+    fn get_max_vcpus(&self) -> u32 {
+        // TODO: Using HV_MAXIMUM_PROCESSORS would be better
+        // but the ioctl API is limited to u8
+        256
     }
 }
 
@@ -285,15 +298,17 @@ pub struct MshvVcpu {
 }
 
 /// Implementation of Vcpu trait for Microsoft Hypervisor
-/// Example:
-/// #[cfg(feature = "mshv")]
-/// extern crate hypervisor
-/// let mshv = hypervisor::mshv::MshvHypervisor::new().unwrap();
-/// let hypervisor: Arc<dyn hypervisor::Hypervisor> = Arc::new(mshv);
-/// let vm = hypervisor.create_vm().expect("new VM fd creation failed");
-/// let vcpu = vm.create_vcpu(0).unwrap();
-/// vcpu.get/set().unwrap()
 ///
+/// # Examples
+///
+/// ```
+/// # use hypervisor::mshv::MshvHypervisor;
+/// # use std::sync::Arc;
+/// let mshv = MshvHypervisor::new().unwrap();
+/// let hypervisor = Arc::new(mshv);
+/// let vm = hypervisor.create_vm().expect("new VM fd creation failed");
+/// let vcpu = vm.create_vcpu(0, None).unwrap();
+/// ```
 impl cpu::Vcpu for MshvVcpu {
     #[cfg(target_arch = "x86_64")]
     ///
@@ -446,10 +461,10 @@ impl cpu::Vcpu for MshvVcpu {
                             /* Advance RIP and update RAX */
                             let arr_reg_name_value = [
                                 (
-                                    hv_x64_register_name_HV_X64_REGISTER_RIP,
+                                    hv_register_name_HV_X64_REGISTER_RIP,
                                     info.header.rip + insn_len,
                                 ),
-                                (hv_x64_register_name_HV_X64_REGISTER_RAX, ret_rax),
+                                (hv_register_name_HV_X64_REGISTER_RAX, ret_rax),
                             ];
                             set_registers_64!(self.fd, arr_reg_name_value)
                                 .map_err(|e| cpu::HypervisorCpuError::SetRegister(e.into()))?;
@@ -495,10 +510,10 @@ impl cpu::Vcpu for MshvVcpu {
                     /* Advance RIP and update RAX */
                     let arr_reg_name_value = [
                         (
-                            hv_x64_register_name_HV_X64_REGISTER_RIP,
+                            hv_register_name_HV_X64_REGISTER_RIP,
                             info.header.rip + insn_len,
                         ),
-                        (hv_x64_register_name_HV_X64_REGISTER_RAX, ret_rax),
+                        (hv_register_name_HV_X64_REGISTER_RAX, ret_rax),
                     ];
                     set_registers_64!(self.fd, arr_reg_name_value)
                         .map_err(|e| cpu::HypervisorCpuError::SetRegister(e.into()))?;
@@ -568,8 +583,14 @@ impl cpu::Vcpu for MshvVcpu {
     ///
     /// X86 specific call to setup the CPUID registers.
     ///
-    fn set_cpuid2(&self, _cpuid: &[CpuIdEntry]) -> cpu::Result<()> {
-        Ok(())
+    fn set_cpuid2(&self, cpuid: &[CpuIdEntry]) -> cpu::Result<()> {
+        let cpuid: Vec<mshv_bindings::hv_cpuid_entry> = cpuid.iter().map(|e| (*e).into()).collect();
+        let mshv_cpuid = <CpuId>::from_entries(&cpuid)
+            .map_err(|_| cpu::HypervisorCpuError::SetCpuid(anyhow!("failed to create CpuId")))?;
+
+        self.fd
+            .register_intercept_result_cpuid(&mshv_cpuid)
+            .map_err(|e| cpu::HypervisorCpuError::SetCpuid(e.into()))
     }
     #[cfg(target_arch = "x86_64")]
     ///
@@ -917,15 +938,17 @@ impl MshvVm {
 
 ///
 /// Implementation of Vm trait for Mshv
-/// Example:
-/// #[cfg(feature = "mshv")]
-/// # extern crate hypervisor;
-/// # use hypervisor::MshvHypervisor;
-/// let mshv = MshvHypervisor::new().unwrap();
-/// let hypervisor: Arc<dyn hypervisor::Hypervisor> = Arc::new(mshv);
-/// let vm = hypervisor.create_vm().expect("new VM fd creation failed");
-/// vm.set/get().unwrap()
 ///
+/// # Examples
+///
+/// ```
+/// # extern crate hypervisor;
+/// # use hypervisor::mshv::MshvHypervisor;
+/// # use std::sync::Arc;
+/// let mshv = MshvHypervisor::new().unwrap();
+/// let hypervisor = Arc::new(mshv);
+/// let vm = hypervisor.create_vm().expect("new VM fd creation failed");
+/// ```
 impl vm::Vm for MshvVm {
     #[cfg(target_arch = "x86_64")]
     ///

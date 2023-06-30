@@ -3,13 +3,13 @@ name = "performance-metrics"
 version = "0.1.0"
 authors = ["The Cloud Hypervisor Authors"]
 edition = "2021"
-build = "build.rs"
+build = "../build.rs"
 
 [dependencies]
 argh = "0.1.9"
-dirs = "4.0.0"
-serde = { version = "1.0.151", features = ["rc", "derive"] }
-serde_json = "1.0.89"
+dirs = "5.0.0"
+serde = { version = "1.0.164", features = ["rc", "derive"] }
+serde_json = "1.0.96"
 test_infra = { path = "../test_infra" }
-thiserror = "1.0.38"
+thiserror = "1.0.40"
 wait-timeout = "0.2.0"

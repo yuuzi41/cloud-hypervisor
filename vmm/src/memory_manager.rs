@@ -12,7 +12,7 @@ use crate::coredump::{
 use crate::migration::url_to_path;
 use crate::MEMORY_MANAGER_SNAPSHOT_ID;
 use crate::{GuestMemoryMmap, GuestRegionMmap};
-use acpi_tables::{aml, aml::Aml};
+use acpi_tables::{aml, Aml};
 use anyhow::anyhow;
 #[cfg(target_arch = "x86_64")]
 use arch::x86_64::{SgxEpcRegion, SgxEpcSection};
@@ -31,7 +31,7 @@ use std::convert::TryInto;
 use std::ffi;
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read};
-use std::ops::Deref;
+use std::ops::{BitAnd, Deref, Not, Sub};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::path::PathBuf;
 use std::result;
@@ -327,6 +327,15 @@ pub enum Error {
     #[cfg(target_arch = "aarch64")]
     /// Failed to create UEFI flash
     CreateUefiFlash(HypervisorVmError),
+
+    /// Using a directory as a backing file for memory is not supported
+    DirectoryAsBackingFileForMemory,
+
+    /// Failed to stat filesystem
+    GetFileSystemBlockSize(io::Error),
+
+    /// Memory size is misaligned with default page size or its hugepage size
+    MisalignedMemorySize,
 }
 
 const ENABLE_FLAG: usize = 0;
@@ -348,6 +357,77 @@ const SELECTION_OFFSET: u64 = 0;
 //  - Windows requires the addressable space size to be 64k aligned
 fn mmio_address_space_size(phys_bits: u8) -> u64 {
     (1 << phys_bits) - (1 << 16)
+}
+
+// The `statfs` function can get information of hugetlbfs, and the hugepage size is in the
+// `f_bsize` field.
+//
+// See: https://github.com/torvalds/linux/blob/v6.3/fs/hugetlbfs/inode.c#L1169
+fn statfs_get_bsize(path: &str) -> Result<u64, Error> {
+    let path = std::ffi::CString::new(path).map_err(|_| Error::InvalidMemoryParameters)?;
+    let mut buf = std::mem::MaybeUninit::<libc::statfs>::uninit();
+
+    // SAFETY: FFI call with a valid path and buffer
+    let ret = unsafe { libc::statfs(path.as_ptr(), buf.as_mut_ptr()) };
+    if ret != 0 {
+        return Err(Error::GetFileSystemBlockSize(
+            std::io::Error::last_os_error(),
+        ));
+    }
+
+    // SAFETY: `buf` is valid at this point
+    // Because this value is always positive, just convert it directly.
+    // Note that the `f_bsize` is `i64` in glibc and `u64` in musl, using `as u64` will be warned
+    // by `clippy` on musl target.  To avoid the warning, there should be `as _` instead of
+    // `as u64`.
+    let bsize = unsafe { (*buf.as_ptr()).f_bsize } as _;
+    Ok(bsize)
+}
+
+fn memory_zone_get_align_size(zone: &MemoryZoneConfig) -> Result<u64, Error> {
+    // SAFETY: FFI call. Trivially safe.
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) as u64 };
+
+    // There is no backend file and the `hugepages` is disabled, just use system page size.
+    if zone.file.is_none() && !zone.hugepages {
+        return Ok(page_size);
+    }
+
+    // The `hugepages` is enabled and the `hugepage_size` is specified, just use it directly.
+    if zone.hugepages && zone.hugepage_size.is_some() {
+        return Ok(zone.hugepage_size.unwrap());
+    }
+
+    // There are two scenarios here:
+    //  - `hugepages` is enabled but `hugepage_size` is not specified:
+    //     Call `statfs` for `/dev/hugepages` for getting the default size of hugepage
+    //  - The backing file is specified:
+    //     Call `statfs` for the file and get its `f_bsize`.  If the value is larger than the page
+    //     size of normal page, just use the `f_bsize` because the file is in a hugetlbfs.  If the
+    //     value is less than or equal to the page size, just use the page size.
+    let path = zone.file.as_ref().map_or(Ok("/dev/hugepages"), |pathbuf| {
+        pathbuf.to_str().ok_or(Error::InvalidMemoryParameters)
+    })?;
+
+    let align_size = std::cmp::max(page_size, statfs_get_bsize(path)?);
+
+    Ok(align_size)
+}
+
+#[inline]
+fn align_down<T>(val: T, align: T) -> T
+where
+    T: BitAnd<Output = T> + Not<Output = T> + Sub<Output = T> + From<u8>,
+{
+    val & !(align - 1u8.into())
+}
+
+#[inline]
+fn is_aligned<T>(val: T, align: T) -> bool
+where
+    T: BitAnd<Output = T> + Sub<Output = T> + From<u8> + PartialEq,
+{
+    (val & (align - 1u8.into())) == 0u8.into()
 }
 
 impl BusDevice for MemoryManager {
@@ -439,6 +519,9 @@ impl MemoryManager {
     /// - First one mapping entirely the first memory zone on 0-1G range
     /// - Second one mapping partially the second memory zone on 1G-3G range
     /// - Third one mapping partially the second memory zone on 4G-6G range
+    /// Also, all memory regions are page-size aligned (e.g. their sizes must
+    /// be multiple of page-size), which may leave an additional hole in the
+    /// address space when hugepage is used.
     fn create_memory_regions_from_zones(
         ram_regions: &[(GuestAddress, usize)],
         zones: &[MemoryZoneConfig],
@@ -448,8 +531,13 @@ impl MemoryManager {
         let mut zones = zones.to_owned();
         let mut mem_regions = Vec::new();
         let mut zone = zones.remove(0);
-        let mut zone_offset = 0;
+        let mut zone_align_size = memory_zone_get_align_size(&zone)?;
+        let mut zone_offset = 0u64;
         let mut memory_zones = HashMap::new();
+
+        if !is_aligned(zone.size, zone_align_size) {
+            return Err(Error::MisalignedMemorySize);
+        }
 
         // Add zone id to the list of memory zones.
         memory_zones.insert(zone.id.clone(), MemoryZone::default());
@@ -462,16 +550,20 @@ impl MemoryManager {
                 let mut ram_region_consumed = false;
                 let mut pull_next_zone = false;
 
-                let ram_region_sub_size = ram_region.1 - ram_region_offset;
-                let zone_sub_size = zone.size as usize - zone_offset;
+                let ram_region_available_size =
+                    align_down(ram_region.1 as u64 - ram_region_offset, zone_align_size);
+                if ram_region_available_size == 0 {
+                    break;
+                }
+                let zone_sub_size = zone.size - zone_offset;
 
-                let file_offset = zone_offset as u64;
+                let file_offset = zone_offset;
                 let region_start = ram_region
                     .0
-                    .checked_add(ram_region_offset as u64)
+                    .checked_add(ram_region_offset)
                     .ok_or(Error::GuestAddressOverFlow)?;
-                let region_size = if zone_sub_size <= ram_region_sub_size {
-                    if zone_sub_size == ram_region_sub_size {
+                let region_size = if zone_sub_size <= ram_region_available_size {
+                    if zone_sub_size == ram_region_available_size {
                         ram_region_consumed = true;
                     }
 
@@ -480,21 +572,24 @@ impl MemoryManager {
 
                     zone_sub_size
                 } else {
-                    zone_offset += ram_region_sub_size;
+                    zone_offset += ram_region_available_size;
                     ram_region_consumed = true;
 
-                    ram_region_sub_size
+                    ram_region_available_size
                 };
 
+                info!(
+                    "create ram region for zone {}, region_start: {:#x}, region_size: {:#x}",
+                    zone.id,
+                    region_start.raw_value(),
+                    region_size
+                );
                 let region = MemoryManager::create_ram_region(
                     &zone.file,
                     file_offset,
                     region_start,
-                    region_size,
-                    match prefault {
-                        Some(pf) => pf,
-                        None => zone.prefault,
-                    },
+                    region_size as usize,
+                    prefault.unwrap_or(zone.prefault),
                     zone.shared,
                     zone.hugepages,
                     zone.hugepage_size,
@@ -519,6 +614,10 @@ impl MemoryManager {
                         break;
                     }
                     zone = zones.remove(0);
+                    zone_align_size = memory_zone_get_align_size(&zone)?;
+                    if !is_aligned(zone.size, zone_align_size) {
+                        return Err(Error::MisalignedMemorySize);
+                    }
 
                     // Check if zone id already exist. In case it does, throw
                     // an error as we need unique identifiers. Otherwise, add
@@ -570,10 +669,7 @@ impl MemoryManager {
                         guest_ram_mapping.file_offset,
                         GuestAddress(guest_ram_mapping.gpa),
                         guest_ram_mapping.size as usize,
-                        match prefault {
-                            Some(pf) => pf,
-                            None => zone_config.prefault,
-                        },
+                        prefault.unwrap_or(zone_config.prefault),
                         zone_config.shared,
                         zone_config.hugepages,
                         zone_config.hugepage_size,
@@ -773,7 +869,7 @@ impl MemoryManager {
         }
     }
 
-    fn allocate_address_space(&mut self) -> Result<(), Error> {
+    pub fn allocate_address_space(&mut self) -> Result<(), Error> {
         let mut list = Vec::new();
 
         for (zone_id, memory_zone) in self.memory_zones.iter() {
@@ -936,7 +1032,7 @@ impl MemoryManager {
             )
         } else {
             // Init guest memory
-            let arch_mem_regions = arch::arch_memory_regions(ram_size);
+            let arch_mem_regions = arch::arch_memory_regions();
 
             let ram_regions: Vec<(GuestAddress, usize)> = arch_mem_regions
                 .iter()
@@ -994,10 +1090,7 @@ impl MemoryManager {
                                 0,
                                 start_addr,
                                 hotplug_size as usize,
-                                match prefault {
-                                    Some(pf) => pf,
-                                    None => zone.prefault,
-                                },
+                                prefault.unwrap_or(zone.prefault),
                                 zone.shared,
                                 zone.hugepages,
                                 zone.hugepage_size,
@@ -1135,10 +1228,17 @@ impl MemoryManager {
             thp: config.thp,
         };
 
-        memory_manager.allocate_address_space()?;
-
         #[cfg(target_arch = "aarch64")]
-        memory_manager.add_uefi_flash()?;
+        {
+            // For Aarch64 we cannot lazily allocate the address space like we
+            // do for x86, because while restoring a VM from snapshot we would
+            // need the address space to be allocated to properly restore VGIC.
+            // And the restore of VGIC happens before we attempt to run the vCPUs
+            // for the first time, thus we need to allocate the address space
+            // beforehand.
+            memory_manager.allocate_address_space()?;
+            memory_manager.add_uefi_flash()?;
+        }
 
         #[cfg(target_arch = "x86_64")]
         if let Some(sgx_epc_config) = sgx_epc_config {
@@ -1264,37 +1364,9 @@ impl MemoryManager {
         Ok(FileOffset::new(f, 0))
     }
 
-    fn open_backing_file(
-        backing_file: &PathBuf,
-        file_offset: u64,
-        size: usize,
-    ) -> Result<FileOffset, Error> {
+    fn open_backing_file(backing_file: &PathBuf, file_offset: u64) -> Result<FileOffset, Error> {
         if backing_file.is_dir() {
-            warn!(
-                "Using a directory as a backing file for memory is deprecated \
-                and will be removed in a future release. (See #5082)"
-            );
-            // Override file offset as it does not apply in this case.
-            info!(
-                "Ignoring file offset since the backing file is a \
-                        temporary file created from the specified directory."
-            );
-            let fs_str = format!("{}{}", backing_file.display(), "/tmpfile_XXXXXX");
-            let fs = ffi::CString::new(fs_str).unwrap();
-            let mut path = fs.as_bytes_with_nul().to_owned();
-            let path_ptr = path.as_mut_ptr() as *mut _;
-            // SAFETY: FFI call
-            let fd = unsafe { libc::mkstemp(path_ptr) };
-            if fd == -1 {
-                return Err(Error::SharedFileCreate(std::io::Error::last_os_error()));
-            }
-            // SAFETY: FFI call
-            unsafe { libc::unlink(path_ptr) };
-            // SAFETY: fd is valid
-            let f = unsafe { File::from_raw_fd(fd) };
-            f.set_len(size as u64).map_err(Error::SharedFileSetLen)?;
-
-            Ok(FileOffset::new(f, 0))
+            Err(Error::DirectoryAsBackingFileForMemory)
         } else {
             let f = OpenOptions::new()
                 .read(true)
@@ -1334,7 +1406,7 @@ impl MemoryManager {
             } else {
                 mmap_flags |= libc::MAP_PRIVATE;
             }
-            Some(Self::open_backing_file(backing_file, file_offset, size)?)
+            Some(Self::open_backing_file(backing_file, file_offset)?)
         } else if shared || hugepages {
             // For hugepages we must also MAP_SHARED otherwise we will trigger #4805
             // because the MAP_PRIVATE will trigger CoW against the backing file with
@@ -1519,7 +1591,7 @@ impl MemoryManager {
             .ok_or(Error::MemoryRangeAllocation)?;
 
         // Update the slot so that it can be queried via the I/O port
-        let mut slot = &mut self.hotplug_slots[self.next_hotplug_slot];
+        let slot = &mut self.hotplug_slots[self.next_hotplug_slot];
         slot.active = true;
         slot.inserting = true;
         slot.base = region.start_addr().0;
@@ -2087,13 +2159,13 @@ struct MemoryNotify {
 }
 
 impl Aml for MemoryNotify {
-    fn append_aml_bytes(&self, bytes: &mut Vec<u8>) {
+    fn to_aml_bytes(&self, sink: &mut dyn acpi_tables::AmlSink) {
         let object = aml::Path::new(&format!("M{:03}", self.slot_id));
         aml::If::new(
             &aml::Equal::new(&aml::Arg(0), &self.slot_id),
             vec![&aml::Notify::new(&object, &aml::Arg(1))],
         )
-        .append_aml_bytes(bytes)
+        .to_aml_bytes(sink)
     }
 }
 
@@ -2102,11 +2174,11 @@ struct MemorySlot {
 }
 
 impl Aml for MemorySlot {
-    fn append_aml_bytes(&self, bytes: &mut Vec<u8>) {
+    fn to_aml_bytes(&self, sink: &mut dyn acpi_tables::AmlSink) {
         aml::Device::new(
             format!("M{:03}", self.slot_id).as_str().into(),
             vec![
-                &aml::Name::new("_HID".into(), &aml::EisaName::new("PNP0C80")),
+                &aml::Name::new("_HID".into(), &aml::EISAName::new("PNP0C80")),
                 &aml::Name::new("_UID".into(), &self.slot_id),
                 /*
                 _STA return value:
@@ -2140,7 +2212,7 @@ impl Aml for MemorySlot {
                 ),
             ],
         )
-        .append_aml_bytes(bytes)
+        .to_aml_bytes(sink)
     }
 }
 
@@ -2149,9 +2221,9 @@ struct MemorySlots {
 }
 
 impl Aml for MemorySlots {
-    fn append_aml_bytes(&self, bytes: &mut Vec<u8>) {
+    fn to_aml_bytes(&self, sink: &mut dyn acpi_tables::AmlSink) {
         for slot_id in 0..self.slots {
-            MemorySlot { slot_id }.append_aml_bytes(bytes);
+            MemorySlot { slot_id }.to_aml_bytes(sink);
         }
     }
 }
@@ -2161,19 +2233,19 @@ struct MemoryMethods {
 }
 
 impl Aml for MemoryMethods {
-    fn append_aml_bytes(&self, bytes: &mut Vec<u8>) {
+    fn to_aml_bytes(&self, sink: &mut dyn acpi_tables::AmlSink) {
         // Add "MTFY" notification method
         let mut memory_notifies = Vec::new();
         for slot_id in 0..self.slots {
             memory_notifies.push(MemoryNotify { slot_id });
         }
 
-        let mut memory_notifies_refs: Vec<&dyn aml::Aml> = Vec::new();
+        let mut memory_notifies_refs: Vec<&dyn Aml> = Vec::new();
         for memory_notifier in memory_notifies.iter() {
             memory_notifies_refs.push(memory_notifier);
         }
 
-        aml::Method::new("MTFY".into(), 2, true, memory_notifies_refs).append_aml_bytes(bytes);
+        aml::Method::new("MTFY".into(), 2, true, memory_notifies_refs).to_aml_bytes(sink);
 
         // MSCN method
         aml::Method::new(
@@ -2219,7 +2291,7 @@ impl Aml for MemoryMethods {
                 &aml::Release::new("MLCK".into()),
             ],
         )
-        .append_aml_bytes(bytes);
+        .to_aml_bytes(sink);
 
         // Memory status method
         aml::Method::new(
@@ -2243,7 +2315,7 @@ impl Aml for MemoryMethods {
                 &aml::Return::new(&aml::Local(0)),
             ],
         )
-        .append_aml_bytes(bytes);
+        .to_aml_bytes(sink);
 
         // Memory range method
         aml::Method::new(
@@ -2262,14 +2334,39 @@ impl Aml for MemoryMethods {
                         true,
                         0x0000_0000_0000_0000u64,
                         0xFFFF_FFFF_FFFF_FFFEu64,
+                        None,
                     )]),
                 ),
-                &aml::CreateField::<u64>::new(&aml::Path::new("MR64"), &14usize, "MINL".into()),
-                &aml::CreateField::<u32>::new(&aml::Path::new("MR64"), &18usize, "MINH".into()),
-                &aml::CreateField::<u64>::new(&aml::Path::new("MR64"), &22usize, "MAXL".into()),
-                &aml::CreateField::<u32>::new(&aml::Path::new("MR64"), &26usize, "MAXH".into()),
-                &aml::CreateField::<u64>::new(&aml::Path::new("MR64"), &38usize, "LENL".into()),
-                &aml::CreateField::<u32>::new(&aml::Path::new("MR64"), &42usize, "LENH".into()),
+                &aml::CreateQWordField::new(
+                    &aml::Path::new("MINL"),
+                    &aml::Path::new("MR64"),
+                    &14usize,
+                ),
+                &aml::CreateDWordField::new(
+                    &aml::Path::new("MINH"),
+                    &aml::Path::new("MR64"),
+                    &18usize,
+                ),
+                &aml::CreateQWordField::new(
+                    &aml::Path::new("MAXL"),
+                    &aml::Path::new("MR64"),
+                    &22usize,
+                ),
+                &aml::CreateDWordField::new(
+                    &aml::Path::new("MAXH"),
+                    &aml::Path::new("MR64"),
+                    &26usize,
+                ),
+                &aml::CreateQWordField::new(
+                    &aml::Path::new("LENL"),
+                    &aml::Path::new("MR64"),
+                    &38usize,
+                ),
+                &aml::CreateDWordField::new(
+                    &aml::Path::new("LENH"),
+                    &aml::Path::new("MR64"),
+                    &42usize,
+                ),
                 &aml::Store::new(&aml::Path::new("MINL"), &aml::Path::new("\\_SB_.MHPC.MHBL")),
                 &aml::Store::new(&aml::Path::new("MINH"), &aml::Path::new("\\_SB_.MHPC.MHBH")),
                 &aml::Store::new(&aml::Path::new("LENL"), &aml::Path::new("\\_SB_.MHPC.MHLL")),
@@ -2298,18 +2395,18 @@ impl Aml for MemoryMethods {
                 &aml::Return::new(&aml::Path::new("MR64")),
             ],
         )
-        .append_aml_bytes(bytes)
+        .to_aml_bytes(sink)
     }
 }
 
 impl Aml for MemoryManager {
-    fn append_aml_bytes(&self, bytes: &mut Vec<u8>) {
+    fn to_aml_bytes(&self, sink: &mut dyn acpi_tables::AmlSink) {
         if let Some(acpi_address) = self.acpi_address {
             // Memory Hotplug Controller
             aml::Device::new(
                 "_SB_.MHPC".into(),
                 vec![
-                    &aml::Name::new("_HID".into(), &aml::EisaName::new("PNP0A06")),
+                    &aml::Name::new("_HID".into(), &aml::EISAName::new("PNP0A06")),
                     &aml::Name::new("_UID".into(), &"Memory Hotplug Controller"),
                     // Mutex to protect concurrent access as we write to choose slot and then read back status
                     &aml::Mutex::new("MLCK".into(), 0),
@@ -2320,18 +2417,20 @@ impl Aml for MemoryManager {
                             true,
                             acpi_address.0,
                             acpi_address.0 + MEMORY_MANAGER_ACPI_SIZE as u64 - 1,
+                            None,
                         )]),
                     ),
                     // OpRegion and Fields map MMIO range into individual field values
                     &aml::OpRegion::new(
                         "MHPR".into(),
                         aml::OpRegionSpace::SystemMemory,
-                        acpi_address.0 as usize,
-                        MEMORY_MANAGER_ACPI_SIZE,
+                        &(acpi_address.0 as usize),
+                        &MEMORY_MANAGER_ACPI_SIZE,
                     ),
                     &aml::Field::new(
                         "MHPR".into(),
                         aml::FieldAccessType::DWord,
+                        aml::FieldLockRule::NoLock,
                         aml::FieldUpdateRule::Preserve,
                         vec![
                             aml::FieldEntry::Named(*b"MHBL", 32), // Base (low 4 bytes)
@@ -2343,6 +2442,7 @@ impl Aml for MemoryManager {
                     &aml::Field::new(
                         "MHPR".into(),
                         aml::FieldAccessType::DWord,
+                        aml::FieldLockRule::NoLock,
                         aml::FieldUpdateRule::Preserve,
                         vec![
                             aml::FieldEntry::Reserved(128),
@@ -2352,6 +2452,7 @@ impl Aml for MemoryManager {
                     &aml::Field::new(
                         "MHPR".into(),
                         aml::FieldAccessType::Byte,
+                        aml::FieldLockRule::NoLock,
                         aml::FieldUpdateRule::WriteAsZeroes,
                         vec![
                             aml::FieldEntry::Reserved(160),
@@ -2364,6 +2465,7 @@ impl Aml for MemoryManager {
                     &aml::Field::new(
                         "MHPR".into(),
                         aml::FieldAccessType::DWord,
+                        aml::FieldLockRule::NoLock,
                         aml::FieldUpdateRule::Preserve,
                         vec![
                             aml::FieldEntry::Named(*b"MSEL", 32), // Selector
@@ -2379,18 +2481,18 @@ impl Aml for MemoryManager {
                     },
                 ],
             )
-            .append_aml_bytes(bytes);
+            .to_aml_bytes(sink);
         } else {
             aml::Device::new(
                 "_SB_.MHPC".into(),
                 vec![
-                    &aml::Name::new("_HID".into(), &aml::EisaName::new("PNP0A06")),
+                    &aml::Name::new("_HID".into(), &aml::EISAName::new("PNP0A06")),
                     &aml::Name::new("_UID".into(), &"Memory Hotplug Controller"),
                     // Empty MSCN for GED
                     &aml::Method::new("MSCN".into(), 0, true, vec![]),
                 ],
             )
-            .append_aml_bytes(bytes);
+            .to_aml_bytes(sink);
         }
 
         #[cfg(target_arch = "x86_64")]
@@ -2402,7 +2504,7 @@ impl Aml for MemoryManager {
                 aml::Device::new(
                     "_SB_.EPC_".into(),
                     vec![
-                        &aml::Name::new("_HID".into(), &aml::EisaName::new("INT0E0C")),
+                        &aml::Name::new("_HID".into(), &aml::EISAName::new("INT0E0C")),
                         // QWORD describing the EPC region start and size
                         &aml::Name::new(
                             "_CRS".into(),
@@ -2411,12 +2513,13 @@ impl Aml for MemoryManager {
                                 true,
                                 min,
                                 max,
+                                None,
                             )]),
                         ),
                         &aml::Method::new("_STA".into(), 0, false, vec![&aml::Return::new(&0xfu8)]),
                     ],
                 )
-                .append_aml_bytes(bytes);
+                .to_aml_bytes(sink);
             }
         }
     }

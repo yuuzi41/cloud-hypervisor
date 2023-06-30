@@ -106,7 +106,7 @@ pub use {
 const KVM_CAP_SGX_ATTRIBUTE: u32 = 196;
 
 #[cfg(feature = "tdx")]
-const KVM_EXIT_TDX: u32 = 35;
+const KVM_EXIT_TDX: u32 = 50;
 #[cfg(feature = "tdx")]
 const TDG_VP_VMCALL_GET_QUOTE: u64 = 0x10002;
 #[cfg(feature = "tdx")]
@@ -330,21 +330,22 @@ impl KvmVm {
         Ok(VfioDeviceFd::new_from_kvm(device_fd))
     }
     /// Checks if a particular `Cap` is available.
-    fn check_extension(&self, c: Cap) -> bool {
+    pub fn check_extension(&self, c: Cap) -> bool {
         self.fd.check_extension(c)
     }
 }
 
-///
 /// Implementation of Vm trait for KVM
-/// Example:
-/// #[cfg(feature = "kvm")]
-/// extern crate hypervisor
-/// let kvm = hypervisor::kvm::KvmHypervisor::new().unwrap();
-/// let hypervisor: Arc<dyn hypervisor::Hypervisor> = Arc::new(kvm);
-/// let vm = hypervisor.create_vm().expect("new VM fd creation failed");
-/// vm.set/get().unwrap()
 ///
+/// # Examples
+///
+/// ```
+/// # use hypervisor::kvm::KvmHypervisor;
+/// # use std::sync::Arc;
+/// let kvm = KvmHypervisor::new().unwrap();
+/// let hypervisor = Arc::new(kvm);
+/// let vm = hypervisor.create_vm().expect("new VM fd creation failed");
+/// ```
 impl vm::Vm for KvmVm {
     #[cfg(target_arch = "x86_64")]
     ///
@@ -746,36 +747,34 @@ impl vm::Vm for KvmVm {
     ///
     #[cfg(feature = "tdx")]
     fn tdx_init(&self, cpuid: &[CpuIdEntry], max_vcpus: u32) -> vm::Result<()> {
-        use std::io::{Error, ErrorKind};
-        let cpuid: Vec<kvm_bindings::kvm_cpuid_entry2> =
+        const TDX_ATTR_SEPT_VE_DISABLE: usize = 28;
+
+        let mut cpuid: Vec<kvm_bindings::kvm_cpuid_entry2> =
             cpuid.iter().map(|e| (*e).into()).collect();
-        let kvm_cpuid = kvm_bindings::CpuId::from_entries(&cpuid).map_err(|_| {
-            vm::HypervisorVmError::InitializeTdx(Error::new(
-                ErrorKind::Other,
-                "failed to allocate CpuId",
-            ))
-        })?;
+        cpuid.resize(256, kvm_bindings::kvm_cpuid_entry2::default());
 
         #[repr(C)]
         struct TdxInitVm {
-            max_vcpus: u32,
-            tsc_khz: u32,
             attributes: u64,
-            cpuid: u64,
+            max_vcpus: u32,
+            padding: u32,
             mrconfigid: [u64; 6],
             mrowner: [u64; 6],
             mrownerconfig: [u64; 6],
-            reserved: [u64; 43],
+            cpuid_nent: u32,
+            cpuid_padding: u32,
+            cpuid_entries: [kvm_bindings::kvm_cpuid_entry2; 256],
         }
         let data = TdxInitVm {
+            attributes: 1 << TDX_ATTR_SEPT_VE_DISABLE,
             max_vcpus,
-            tsc_khz: 0,
-            attributes: 0,
-            cpuid: kvm_cpuid.as_fam_struct_ptr() as u64,
+            padding: 0,
             mrconfigid: [0; 6],
             mrowner: [0; 6],
             mrownerconfig: [0; 6],
-            reserved: [0; 43],
+            cpuid_nent: cpuid.len() as u32,
+            cpuid_padding: 0,
+            cpuid_entries: cpuid.as_slice().try_into().unwrap(),
         };
 
         tdx_command(
@@ -837,19 +836,23 @@ impl vm::Vm for KvmVm {
 fn tdx_command(
     fd: &RawFd,
     command: TdxCommand,
-    metadata: u32,
+    flags: u32,
     data: u64,
 ) -> std::result::Result<(), std::io::Error> {
     #[repr(C)]
     struct TdxIoctlCmd {
         command: TdxCommand,
-        metadata: u32,
+        flags: u32,
         data: u64,
+        error: u64,
+        unused: u64,
     }
     let cmd = TdxIoctlCmd {
         command,
-        metadata,
+        flags,
         data,
+        error: 0,
+        unused: 0,
     };
     // SAFETY: FFI call. All input parameters are valid.
     let ret = unsafe {
@@ -915,13 +918,16 @@ impl KvmHypervisor {
     }
 }
 /// Implementation of Hypervisor trait for KVM
-/// Example:
-/// #[cfg(feature = "kvm")]
-/// extern crate hypervisor
-/// let kvm = hypervisor::kvm::KvmHypervisor::new().unwrap();
-/// let hypervisor: Arc<dyn hypervisor::Hypervisor> = Arc::new(kvm);
-/// let vm = hypervisor.create_vm().expect("new VM fd creation failed");
 ///
+/// # Examples
+///
+/// ```
+/// # use hypervisor::kvm::KvmHypervisor;
+/// # use std::sync::Arc;
+/// let kvm = KvmHypervisor::new().unwrap();
+/// let hypervisor = Arc::new(kvm);
+/// let vm = hypervisor.create_vm().expect("new VM fd creation failed");
+/// ```
 impl hypervisor::Hypervisor for KvmHypervisor {
     ///
     /// Returns the type of the hypervisor
@@ -930,13 +936,15 @@ impl hypervisor::Hypervisor for KvmHypervisor {
         HypervisorType::Kvm
     }
     /// Create a KVM vm object of a specific VM type and return the object as Vm trait object
-    /// Example
-    /// # extern crate hypervisor;
-    /// # use hypervisor::KvmHypervisor;
-    /// use hypervisor::KvmVm;
-    /// let hypervisor = KvmHypervisor::new().unwrap();
-    /// let vm = hypervisor.create_vm_with_type(KvmVmType::LegacyVm).unwrap()
     ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use hypervisor::kvm::KvmHypervisor;
+    /// use hypervisor::kvm::KvmVm;
+    /// let hypervisor = KvmHypervisor::new().unwrap();
+    /// let vm = hypervisor.create_vm_with_type(0).unwrap();
+    /// ```
     fn create_vm_with_type(&self, vm_type: u64) -> hypervisor::Result<Arc<dyn vm::Vm>> {
         let fd: VmFd;
         loop {
@@ -990,13 +998,15 @@ impl hypervisor::Hypervisor for KvmHypervisor {
     }
 
     /// Create a KVM vm object and return the object as Vm trait object
-    /// Example
-    /// # extern crate hypervisor;
-    /// # use hypervisor::KvmHypervisor;
-    /// use hypervisor::KvmVm;
-    /// let hypervisor = KvmHypervisor::new().unwrap();
-    /// let vm = hypervisor.create_vm().unwrap()
     ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use hypervisor::kvm::KvmHypervisor;
+    /// use hypervisor::kvm::KvmVm;
+    /// let hypervisor = KvmHypervisor::new().unwrap();
+    /// let vm = hypervisor.create_vm().unwrap();
+    /// ```
     fn create_vm(&self) -> hypervisor::Result<Arc<dyn vm::Vm>> {
         #[allow(unused_mut)]
         let mut vm_type: u64 = 0; // Create with default platform type
@@ -1021,7 +1031,7 @@ impl hypervisor::Hypervisor for KvmHypervisor {
     ///
     /// X86 specific call to get the system supported CPUID values.
     ///
-    fn get_cpuid(&self) -> hypervisor::Result<Vec<CpuIdEntry>> {
+    fn get_supported_cpuid(&self) -> hypervisor::Result<Vec<CpuIdEntry>> {
         let kvm_cpuid = self
             .kvm
             .get_supported_cpuid(kvm_bindings::KVM_MAX_CPUID_ENTRIES)
@@ -1074,6 +1084,11 @@ impl hypervisor::Hypervisor for KvmHypervisor {
             self.kvm.get_guest_debug_hw_bps() as usize
         }
     }
+
+    /// Get maximum number of vCPUs
+    fn get_max_vcpus(&self) -> u32 {
+        self.kvm.get_max_vcpus().min(u32::MAX as usize) as u32
+    }
 }
 /// Vcpu struct for KVM
 pub struct KvmVcpu {
@@ -1085,15 +1100,17 @@ pub struct KvmVcpu {
     hyperv_synic: AtomicBool,
 }
 /// Implementation of Vcpu trait for KVM
-/// Example:
-/// #[cfg(feature = "kvm")]
-/// extern crate hypervisor
-/// let kvm = hypervisor::kvm::KvmHypervisor::new().unwrap();
-/// let hypervisor: Arc<dyn hypervisor::Hypervisor> = Arc::new(kvm);
+///
+/// # Examples
+///
+/// ```
+/// # use hypervisor::kvm::KvmHypervisor;
+/// # use std::sync::Arc;
+/// let kvm = KvmHypervisor::new().unwrap();
+/// let hypervisor = Arc::new(kvm);
 /// let vm = hypervisor.create_vm().expect("new VM fd creation failed");
 /// let vcpu = vm.create_vcpu(0, None).unwrap();
-/// vcpu.get/set().unwrap()
-///
+/// ```
 impl cpu::Vcpu for KvmVcpu {
     #[cfg(target_arch = "x86_64")]
     ///
@@ -1795,11 +1812,10 @@ impl cpu::Vcpu for KvmVcpu {
     /// # Example
     ///
     /// ```rust
-    /// # extern crate hypervisor;
-    /// # use hypervisor::KvmHypervisor;
+    /// # use hypervisor::kvm::KvmHypervisor;
     /// # use std::sync::Arc;
-    /// let kvm = hypervisor::kvm::KvmHypervisor::new().unwrap();
-    /// let hv: Arc<dyn hypervisor::Hypervisor> = Arc::new(kvm);
+    /// let kvm = KvmHypervisor::new().unwrap();
+    /// let hv = Arc::new(kvm);
     /// let vm = hv.create_vm().expect("new VM fd creation failed");
     /// vm.enable_split_irq().unwrap();
     /// let vcpu = vm.create_vcpu(0, None).unwrap();
@@ -1967,11 +1983,10 @@ impl cpu::Vcpu for KvmVcpu {
     /// # Example
     ///
     /// ```rust
-    /// # extern crate hypervisor;
-    /// # use hypervisor::KvmHypervisor;
+    /// # use hypervisor::kvm::KvmHypervisor;
     /// # use std::sync::Arc;
-    /// let kvm = hypervisor::kvm::KvmHypervisor::new().unwrap();
-    /// let hv: Arc<dyn hypervisor::Hypervisor> = Arc::new(kvm);
+    /// let kvm = KvmHypervisor::new().unwrap();
+    /// let hv = Arc::new(kvm);
     /// let vm = hv.create_vm().expect("new VM fd creation failed");
     /// vm.enable_split_irq().unwrap();
     /// let vcpu = vm.create_vcpu(0, None).unwrap();
@@ -2153,6 +2168,23 @@ impl cpu::Vcpu for KvmVcpu {
         self.fd
             .set_device_attr(&cpu_attr)
             .map_err(|_| cpu::HypervisorCpuError::InitializePmu)
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    ///
+    /// Get the frequency of the TSC if available
+    ///
+    fn tsc_khz(&self) -> cpu::Result<Option<u32>> {
+        match self.fd.get_tsc_khz() {
+            Err(e) => {
+                if e.errno() == libc::EIO {
+                    Ok(None)
+                } else {
+                    Err(cpu::HypervisorCpuError::GetTscKhz(e.into()))
+                }
+            }
+            Ok(v) => Ok(Some(v)),
+        }
     }
 }
 

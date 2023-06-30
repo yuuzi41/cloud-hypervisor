@@ -26,7 +26,7 @@ use crate::GuestRegionMmap;
 use crate::PciDeviceInfo;
 use crate::{device_node, DEVICE_MANAGER_SNAPSHOT_ID};
 use acpi_tables::sdt::GenericAddress;
-use acpi_tables::{aml, aml::Aml};
+use acpi_tables::{aml, Aml};
 use anyhow::anyhow;
 use arch::layout;
 #[cfg(target_arch = "x86_64")]
@@ -530,6 +530,14 @@ pub struct Console {
 }
 
 impl Console {
+    pub fn need_resize(&self) -> bool {
+        if let Some(_resizer) = self.console_resizer.as_ref() {
+            return true;
+        }
+
+        false
+    }
+
     pub fn update_console_size(&self) {
         if let Some(resizer) = self.console_resizer.as_ref() {
             resizer.update_console_size()
@@ -823,6 +831,9 @@ pub struct DeviceManager {
     // pty foreground status,
     console_resize_pipe: Option<Arc<File>>,
 
+    // To restore on exit.
+    original_termios_opt: Arc<Mutex<Option<termios>>>,
+
     // Interrupt controller
     #[cfg(target_arch = "x86_64")]
     interrupt_controller: Option<Arc<Mutex<ioapic::Ioapic>>>,
@@ -1107,6 +1118,7 @@ impl DeviceManager {
             serial_manager: None,
             console_pty: None,
             console_resize_pipe: None,
+            original_termios_opt: Arc::new(Mutex::new(None)),
             virtio_mem_devices: Vec::new(),
             #[cfg(target_arch = "aarch64")]
             gpio_device: None,
@@ -1154,6 +1166,7 @@ impl DeviceManager {
         serial_pty: Option<PtyPair>,
         console_pty: Option<PtyPair>,
         console_resize_pipe: Option<File>,
+        original_termios_opt: Arc<Mutex<Option<termios>>>,
     ) -> DeviceManagerResult<()> {
         trace_scoped!("create_devices");
 
@@ -1208,6 +1221,8 @@ impl DeviceManager {
                     .map_err(DeviceManagerError::EventFd)?,
             )?;
         }
+
+        self.original_termios_opt = original_termios_opt;
 
         self.console = self.add_console_device(
             &legacy_interrupt_manager,
@@ -1828,7 +1843,7 @@ impl DeviceManager {
     }
 
     fn modify_mode<F: FnOnce(&mut termios)>(
-        &self,
+        &mut self,
         fd: RawFd,
         f: F,
     ) -> vmm_sys_util::errno::Result<()> {
@@ -1845,6 +1860,10 @@ impl DeviceManager {
         if ret < 0 {
             return vmm_sys_util::errno::errno_result();
         }
+        let mut original_termios_opt = self.original_termios_opt.lock().unwrap();
+        if original_termios_opt.is_none() {
+            *original_termios_opt = Some(termios);
+        }
         f(&mut termios);
         // SAFETY: Safe because the syscall will only read the extent of termios and we check
         // the return result.
@@ -1856,12 +1875,12 @@ impl DeviceManager {
         Ok(())
     }
 
-    fn set_raw_mode(&self, f: &mut File) -> vmm_sys_util::errno::Result<()> {
+    fn set_raw_mode(&mut self, f: &mut dyn AsRawFd) -> vmm_sys_util::errno::Result<()> {
         // SAFETY: FFI call. Variable t is guaranteed to be a valid termios from modify_mode.
         self.modify_mode(f.as_raw_fd(), |t| unsafe { cfmakeraw(t) })
     }
 
-    fn listen_for_sigwinch_on_tty(&mut self, pty_main: File, pty_sub: File) -> std::io::Result<()> {
+    fn listen_for_sigwinch_on_tty(&mut self, pty_sub: File) -> std::io::Result<()> {
         let seccomp_filter = get_seccomp_filter(
             &self.seccomp_action,
             Thread::PtyForeground,
@@ -1869,14 +1888,8 @@ impl DeviceManager {
         )
         .unwrap();
 
-        match start_sigwinch_listener(seccomp_filter, pty_main, pty_sub) {
-            Ok(pipe) => {
-                self.console_resize_pipe = Some(Arc::new(pipe));
-            }
-            Err(e) => {
-                warn!("Ignoring error from setting up SIGWINCH listener: {}", e)
-            }
-        }
+        self.console_resize_pipe =
+            Some(Arc::new(start_sigwinch_listener(seccomp_filter, pty_sub)?));
 
         Ok(())
     }
@@ -1909,8 +1922,7 @@ impl DeviceManager {
                     self.config.lock().unwrap().console.file = Some(path.clone());
                     let file = main.try_clone().unwrap();
                     assert!(resize_pipe.is_none());
-                    self.listen_for_sigwinch_on_tty(main.try_clone().unwrap(), sub)
-                        .unwrap();
+                    self.listen_for_sigwinch_on_tty(sub).unwrap();
                     self.console_pty = Some(Arc::new(Mutex::new(PtyPair { main, path })));
                     Endpoint::PtyPair(file.try_clone().unwrap(), file)
                 }
@@ -1925,7 +1937,16 @@ impl DeviceManager {
                     return vmm_sys_util::errno::errno_result().map_err(DeviceManagerError::DupFd);
                 }
                 // SAFETY: stdout is valid and owned solely by us.
-                let stdout = unsafe { File::from_raw_fd(stdout) };
+                let mut stdout = unsafe { File::from_raw_fd(stdout) };
+
+                // Make sure stdout is in raw mode, if it's a terminal.
+                let _ = self.set_raw_mode(&mut stdout);
+
+                // SAFETY: FFI call. Trivially safe.
+                if unsafe { libc::isatty(libc::STDOUT_FILENO) } == 1 {
+                    self.listen_for_sigwinch_on_tty(stdout.try_clone().unwrap())
+                        .unwrap();
+                }
 
                 // If an interactive TTY then we can accept input
                 // SAFETY: FFI call. Trivially safe.
@@ -2018,7 +2039,11 @@ impl DeviceManager {
                 }
                 None
             }
-            ConsoleOutputMode::Tty => Some(Box::new(stdout())),
+            ConsoleOutputMode::Tty => {
+                let mut out = stdout();
+                let _ = self.set_raw_mode(&mut out);
+                Some(Box::new(out))
+            }
             ConsoleOutputMode::Off | ConsoleOutputMode::Null => None,
         };
         if serial_config.mode != ConsoleOutputMode::Off {
@@ -2381,26 +2406,31 @@ impl DeviceManager {
                     .map_err(DeviceManagerError::CreateVirtioNet)?,
                 ))
             } else if let Some(fds) = &net_cfg.fds {
-                Arc::new(Mutex::new(
-                    virtio_devices::Net::from_tap_fds(
-                        id.clone(),
-                        fds,
-                        Some(net_cfg.mac),
-                        net_cfg.mtu,
-                        self.force_iommu | net_cfg.iommu,
-                        net_cfg.queue_size,
-                        self.seccomp_action.clone(),
-                        net_cfg.rate_limiter_config,
-                        self.exit_evt
-                            .try_clone()
-                            .map_err(DeviceManagerError::EventFd)?,
-                        state,
-                        net_cfg.offload_tso,
-                        net_cfg.offload_ufo,
-                        net_cfg.offload_csum,
-                    )
-                    .map_err(DeviceManagerError::CreateVirtioNet)?,
-                ))
+                let net = virtio_devices::Net::from_tap_fds(
+                    id.clone(),
+                    fds,
+                    Some(net_cfg.mac),
+                    net_cfg.mtu,
+                    self.force_iommu | net_cfg.iommu,
+                    net_cfg.queue_size,
+                    self.seccomp_action.clone(),
+                    net_cfg.rate_limiter_config,
+                    self.exit_evt
+                        .try_clone()
+                        .map_err(DeviceManagerError::EventFd)?,
+                    state,
+                    net_cfg.offload_tso,
+                    net_cfg.offload_ufo,
+                    net_cfg.offload_csum,
+                )
+                .map_err(DeviceManagerError::CreateVirtioNet)?;
+
+                // SAFETY: 'fds' are valid because TAP devices are created successfully
+                unsafe {
+                    self.config.lock().unwrap().add_preserved_fds(fds.clone());
+                }
+
+                Arc::new(Mutex::new(net))
             } else {
                 Arc::new(Mutex::new(
                     virtio_devices::Net::new(
@@ -4220,7 +4250,7 @@ fn numa_node_id_from_memory_zone_id(numa_nodes: &NumaNodes, memory_zone_id: &str
 struct TpmDevice {}
 
 impl Aml for TpmDevice {
-    fn to_aml_bytes(&self) -> Vec<u8> {
+    fn to_aml_bytes(&self, sink: &mut dyn acpi_tables::AmlSink) {
         aml::Device::new(
             "TPM2".into(),
             vec![
@@ -4236,19 +4266,19 @@ impl Aml for TpmDevice {
                 ),
             ],
         )
-        .to_aml_bytes()
+        .to_aml_bytes(sink)
     }
 }
 
 impl Aml for DeviceManager {
-    fn append_aml_bytes(&self, bytes: &mut Vec<u8>) {
+    fn to_aml_bytes(&self, sink: &mut dyn acpi_tables::AmlSink) {
         #[cfg(target_arch = "aarch64")]
         use arch::aarch64::DeviceInfoForFdt;
 
         let mut pci_scan_methods = Vec::new();
         for i in 0..self.pci_segments.len() {
             pci_scan_methods.push(aml::MethodCall::new(
-                format!("\\_SB_.PCI{i:X}.PCNT").as_str().into(),
+                format!("\\_SB_.PC{i:02X}.PCNT").as_str().into(),
                 vec![],
             ));
         }
@@ -4261,7 +4291,7 @@ impl Aml for DeviceManager {
         aml::Device::new(
             "_SB_.PHPR".into(),
             vec![
-                &aml::Name::new("_HID".into(), &aml::EisaName::new("PNP0A06")),
+                &aml::Name::new("_HID".into(), &aml::EISAName::new("PNP0A06")),
                 &aml::Name::new("_STA".into(), &0x0bu8),
                 &aml::Name::new("_UID".into(), &"PCI Hotplug Controller"),
                 &aml::Mutex::new("BLCK".into(), 0),
@@ -4272,18 +4302,20 @@ impl Aml for DeviceManager {
                         true,
                         self.acpi_address.0,
                         self.acpi_address.0 + DEVICE_MANAGER_ACPI_SIZE as u64 - 1,
+                        None,
                     )]),
                 ),
                 // OpRegion and Fields map MMIO range into individual field values
                 &aml::OpRegion::new(
                     "PCST".into(),
                     aml::OpRegionSpace::SystemMemory,
-                    self.acpi_address.0 as usize,
-                    DEVICE_MANAGER_ACPI_SIZE,
+                    &(self.acpi_address.0 as usize),
+                    &DEVICE_MANAGER_ACPI_SIZE,
                 ),
                 &aml::Field::new(
                     "PCST".into(),
                     aml::FieldAccessType::DWord,
+                    aml::FieldLockRule::NoLock,
                     aml::FieldUpdateRule::WriteAsZeroes,
                     vec![
                         aml::FieldEntry::Named(*b"PCIU", 32),
@@ -4312,10 +4344,10 @@ impl Aml for DeviceManager {
                 &aml::Method::new("PSCN".into(), 0, true, pci_scan_inner),
             ],
         )
-        .append_aml_bytes(bytes);
+        .to_aml_bytes(sink);
 
         for segment in &self.pci_segments {
-            segment.append_aml_bytes(bytes);
+            segment.to_aml_bytes(sink);
         }
 
         let mut mbrd_memory = Vec::new();
@@ -4336,12 +4368,12 @@ impl Aml for DeviceManager {
         aml::Device::new(
             "_SB_.MBRD".into(),
             vec![
-                &aml::Name::new("_HID".into(), &aml::EisaName::new("PNP0C02")),
+                &aml::Name::new("_HID".into(), &aml::EISAName::new("PNP0C02")),
                 &aml::Name::new("_UID".into(), &aml::ZERO),
                 &aml::Name::new("_CRS".into(), &aml::ResourceTemplate::new(mbrd_memory_refs)),
             ],
         )
-        .append_aml_bytes(bytes);
+        .to_aml_bytes(sink);
 
         // Serial device
         #[cfg(target_arch = "x86_64")]
@@ -4365,7 +4397,7 @@ impl Aml for DeviceManager {
                     &aml::Name::new(
                         "_HID".into(),
                         #[cfg(target_arch = "x86_64")]
-                        &aml::EisaName::new("PNP0501"),
+                        &aml::EISAName::new("PNP0501"),
                         #[cfg(target_arch = "aarch64")]
                         &"ARMH0011",
                     ),
@@ -4376,7 +4408,7 @@ impl Aml for DeviceManager {
                         &aml::ResourceTemplate::new(vec![
                             &aml::Interrupt::new(true, true, false, false, serial_irq),
                             #[cfg(target_arch = "x86_64")]
-                            &aml::Io::new(0x3f8, 0x3f8, 0, 0x8),
+                            &aml::IO::new(0x3f8, 0x3f8, 0, 0x8),
                             #[cfg(target_arch = "aarch64")]
                             &aml::Memory32Fixed::new(
                                 true,
@@ -4387,25 +4419,23 @@ impl Aml for DeviceManager {
                     ),
                 ],
             )
-            .append_aml_bytes(bytes);
+            .to_aml_bytes(sink);
         }
 
-        aml::Name::new("_S5_".into(), &aml::Package::new(vec![&5u8])).append_aml_bytes(bytes);
+        aml::Name::new("_S5_".into(), &aml::Package::new(vec![&5u8])).to_aml_bytes(sink);
 
         aml::Device::new(
             "_SB_.PWRB".into(),
             vec![
-                &aml::Name::new("_HID".into(), &aml::EisaName::new("PNP0C0C")),
+                &aml::Name::new("_HID".into(), &aml::EISAName::new("PNP0C0C")),
                 &aml::Name::new("_UID".into(), &aml::ZERO),
             ],
         )
-        .append_aml_bytes(bytes);
+        .to_aml_bytes(sink);
 
         if self.config.lock().unwrap().tpm.is_some() {
             // Add tpm device
-            let tpm_acpi = TpmDevice {};
-            let tpm_dsdt_data = tpm_acpi.to_aml_bytes();
-            bytes.extend_from_slice(tpm_dsdt_data.as_slice());
+            TpmDevice {}.to_aml_bytes(sink);
         }
 
         self.ged_notification_device
@@ -4413,7 +4443,7 @@ impl Aml for DeviceManager {
             .unwrap()
             .lock()
             .unwrap()
-            .append_aml_bytes(bytes);
+            .to_aml_bytes(sink)
     }
 }
 
@@ -4624,6 +4654,11 @@ impl Drop for DeviceManager {
     fn drop(&mut self) {
         for handle in self.virtio_devices.drain(..) {
             handle.virtio_device.lock().unwrap().shutdown();
+        }
+
+        if let Some(termios) = *self.original_termios_opt.lock().unwrap() {
+            // SAFETY: FFI call
+            let _ = unsafe { tcsetattr(stdout().lock().as_raw_fd(), TCSANOW, &termios) };
         }
     }
 }

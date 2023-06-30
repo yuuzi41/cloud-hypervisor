@@ -38,7 +38,7 @@ use std::time::Instant;
 use thiserror::Error;
 use versionize::{VersionMap, Versionize, VersionizeResult};
 use versionize_derive::Versionize;
-use virtio_bindings::bindings::virtio_blk::*;
+use virtio_bindings::virtio_blk::*;
 use virtio_queue::DescriptorChain;
 use vm_memory::{
     bitmap::AtomicBitmap, bitmap::Bitmap, ByteValued, Bytes, GuestAddress, GuestMemory,
@@ -201,7 +201,7 @@ pub struct Request {
     pub data_descriptors: SmallVec<[(GuestAddress, u32); 1]>,
     pub status_addr: GuestAddress,
     pub writeback: bool,
-    pub aligned_operations: Vec<AlignedOperation>,
+    pub aligned_operations: SmallVec<[AlignedOperation; 1]>,
     pub start: Instant,
 }
 
@@ -233,7 +233,7 @@ impl Request {
             data_descriptors: SmallVec::with_capacity(1),
             status_addr: GuestAddress(0),
             writeback: true,
-            aligned_operations: Vec::new(),
+            aligned_operations: SmallVec::with_capacity(1),
             start: Instant::now(),
         };
 
@@ -602,7 +602,7 @@ where
         completion_list: &mut VecDeque<(u64, i32)>,
     ) -> AsyncIoResult<()> {
         // Convert libc::iovec into IoSliceMut
-        let mut slices = Vec::new();
+        let mut slices: SmallVec<[IoSliceMut; 1]> = SmallVec::with_capacity(iovecs.len());
         for iovec in iovecs.iter() {
             // SAFETY: on Linux IoSliceMut wraps around libc::iovec
             slices.push(IoSliceMut::new(unsafe { std::mem::transmute(*iovec) }));
@@ -635,9 +635,9 @@ where
         completion_list: &mut VecDeque<(u64, i32)>,
     ) -> AsyncIoResult<()> {
         // Convert libc::iovec into IoSlice
-        let mut slices = Vec::new();
+        let mut slices: SmallVec<[IoSlice; 1]> = SmallVec::with_capacity(iovecs.len());
         for iovec in iovecs.iter() {
-            // SAFETY: on Linux IoSliceMut wraps around libc::iovec
+            // SAFETY: on Linux IoSlice wraps around libc::iovec
             slices.push(IoSlice::new(unsafe { std::mem::transmute(*iovec) }));
         }
 

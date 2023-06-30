@@ -53,7 +53,7 @@ if [ ! -f "$FOCAL_OS_RAW_IMAGE" ]; then
     popd
 fi
 
-JAMMY_OS_IMAGE_NAME="jammy-server-cloudimg-amd64-custom-20221118-1.qcow2"
+JAMMY_OS_IMAGE_NAME="jammy-server-cloudimg-amd64-custom-20230119-0.qcow2"
 JAMMY_OS_IMAGE_URL="https://cloud-hypervisor.azureedge.net/$JAMMY_OS_IMAGE_NAME"
 JAMMY_OS_IMAGE="$WORKLOADS_DIR/$JAMMY_OS_IMAGE_NAME"
 if [ ! -f "$JAMMY_OS_IMAGE" ]; then
@@ -62,7 +62,7 @@ if [ ! -f "$JAMMY_OS_IMAGE" ]; then
     popd
 fi
 
-JAMMY_OS_RAW_IMAGE_NAME="jammy-server-cloudimg-amd64-custom-20221118-1.raw"
+JAMMY_OS_RAW_IMAGE_NAME="jammy-server-cloudimg-amd64-custom-20230119-0.raw"
 JAMMY_OS_RAW_IMAGE="$WORKLOADS_DIR/$JAMMY_OS_RAW_IMAGE_NAME"
 if [ ! -f "$JAMMY_OS_RAW_IMAGE" ]; then
     pushd $WORKLOADS_DIR
@@ -169,7 +169,9 @@ sudo bash -c "echo 10 > /sys/kernel/mm/ksm/sleep_millisecs"
 sudo bash -c "echo 1 > /sys/kernel/mm/ksm/run"
 
 # Both test_vfio, ovs-dpdk and vDPA tests rely on hugepages
-echo 6144 | sudo tee /proc/sys/vm/nr_hugepages
+HUGEPAGESIZE=`grep Hugepagesize /proc/meminfo | awk '{print $2}'`
+PAGE_NUM=`echo $((12288 * 1024 / $HUGEPAGESIZE))`
+echo $PAGE_NUM | sudo tee /proc/sys/vm/nr_hugepages
 sudo chmod a+rwX /dev/hugepages
 
 # Update max locked memory to 'unlimited' to avoid issues with vDPA
@@ -184,6 +186,15 @@ RES=$?
 if [ $RES -eq 0 ]; then
     export RUST_BACKTRACE=1
     time cargo test $test_features "common_sequential::$test_filter" -- --test-threads=1 ${test_binary_args[*]}
+    RES=$?
+fi
+
+# Run tests on dbus_api
+if [ $RES -eq 0 ]; then
+    cargo build --no-default-features --features "kvm,mshv,dbus_api" --all  --release --target $BUILD_TARGET
+    export RUST_BACKTRACE=1
+    # integration tests now do not reply on build feature "dbus_api"
+    time cargo test $test_features "dbus_api::$test_filter" -- ${test_binary_args[*]}
     RES=$?
 fi
 

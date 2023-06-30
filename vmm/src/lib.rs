@@ -25,7 +25,9 @@ use crate::migration::{recv_vm_config, recv_vm_state};
 use crate::seccomp_filters::{get_seccomp_filter, Thread};
 use crate::vm::{Error as VmError, Vm, VmState};
 use anyhow::anyhow;
-use libc::{EFD_NONBLOCK, SIGINT, SIGTERM};
+#[cfg(feature = "dbus_api")]
+use api::dbus::{DBusApiOptions, DBusApiShutdownChannels};
+use libc::{tcsetattr, termios, EFD_NONBLOCK, SIGINT, SIGTERM, TCSANOW};
 use memory_manager::MemoryManagerSnapshotData;
 use pci::PciBdf;
 use seccompiler::{apply_filter, SeccompAction};
@@ -35,7 +37,7 @@ use signal_hook::iterator::{Handle, Signals};
 use std::collections::HashMap;
 use std::fs::File;
 use std::io;
-use std::io::{Read, Write};
+use std::io::{stdout, Read, Write};
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
@@ -53,7 +55,6 @@ use vm_migration::{MigratableError, Pausable, Snapshot, Snapshottable, Transport
 use vmm_sys_util::eventfd::EventFd;
 use vmm_sys_util::signal::unblock_signal;
 use vmm_sys_util::sock_ctrl_msg::ScmSocket;
-use vmm_sys_util::terminal::Terminal;
 
 mod acpi;
 pub mod api;
@@ -81,7 +82,6 @@ type GuestRegionMmap = vm_memory::GuestRegionMmap<AtomicBitmap>;
 
 /// Errors associated with VMM management
 #[derive(Debug, Error)]
-#[allow(clippy::large_enum_variant)]
 pub enum Error {
     /// API request receive error
     #[error("Error receiving API request: {0}")]
@@ -114,6 +114,16 @@ pub enum Error {
     /// Cannot create HTTP thread
     #[error("Error spawning HTTP thread: {0}")]
     HttpThreadSpawn(#[source] io::Error),
+
+    /// Cannot create D-Bus thread
+    #[cfg(feature = "dbus_api")]
+    #[error("Error spawning D-Bus thread: {0}")]
+    DBusThreadSpawn(#[source] io::Error),
+
+    /// Cannot start D-Bus session
+    #[cfg(feature = "dbus_api")]
+    #[error("Error starting D-Bus session: {0}")]
+    CreateDBusSession(#[source] zbus::Error),
 
     /// Cannot handle the VM STDIN stream
     #[error("Error handling VM stdin: {0:?}")]
@@ -281,18 +291,20 @@ impl Serialize for PciDeviceInfo {
 #[allow(unused_variables)]
 #[allow(clippy::too_many_arguments)]
 pub fn start_vmm_thread(
-    vmm_version: String,
+    vmm_version: VmmVersionInfo,
     http_path: &Option<String>,
     http_fd: Option<RawFd>,
+    #[cfg(feature = "dbus_api")] dbus_options: Option<DBusApiOptions>,
     api_event: EventFd,
     api_sender: Sender<ApiRequest>,
     api_receiver: Receiver<ApiRequest>,
     #[cfg(feature = "guest_debug")] debug_path: Option<PathBuf>,
     #[cfg(feature = "guest_debug")] debug_event: EventFd,
     #[cfg(feature = "guest_debug")] vm_debug_event: EventFd,
+    exit_event: EventFd,
     seccomp_action: &SeccompAction,
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
-) -> Result<thread::JoinHandle<Result<()>>> {
+) -> Result<VmmThreadHandle> {
     #[cfg(feature = "guest_debug")]
     let gdb_hw_breakpoints = hypervisor.get_guest_debug_hw_bps();
     #[cfg(feature = "guest_debug")]
@@ -302,7 +314,7 @@ pub fn start_vmm_thread(
     #[cfg(feature = "guest_debug")]
     let gdb_vm_debug_event = vm_debug_event.try_clone().map_err(Error::EventFdClone)?;
 
-    let http_api_event = api_event.try_clone().map_err(Error::EventFdClone)?;
+    let api_event_clone = api_event.try_clone().map_err(Error::EventFdClone)?;
     let hypervisor_type = hypervisor.hypervisor_type();
 
     // Retrieve seccomp filter
@@ -310,9 +322,8 @@ pub fn start_vmm_thread(
         .map_err(Error::CreateSeccompFilter)?;
 
     let vmm_seccomp_action = seccomp_action.clone();
-    let exit_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?;
     let thread = {
-        let exit_evt = exit_evt.try_clone().map_err(Error::EventFdClone)?;
+        let exit_event = exit_event.try_clone().map_err(Error::EventFdClone)?;
         thread::Builder::new()
             .name("vmm".to_string())
             .spawn(move || {
@@ -322,7 +333,7 @@ pub fn start_vmm_thread(
                 }
 
                 let mut vmm = Vmm::new(
-                    vmm_version.to_string(),
+                    vmm_version,
                     api_event,
                     #[cfg(feature = "guest_debug")]
                     debug_event,
@@ -330,7 +341,7 @@ pub fn start_vmm_thread(
                     vm_debug_event,
                     vmm_seccomp_action,
                     hypervisor,
-                    exit_evt,
+                    exit_event,
                 )?;
 
                 vmm.setup_signal_handler()?;
@@ -344,23 +355,40 @@ pub fn start_vmm_thread(
             .map_err(Error::VmmThreadSpawn)?
     };
 
-    // The VMM thread is started, we can start serving HTTP requests
+    // The VMM thread is started, we can start the dbus thread
+    // and start serving HTTP requests
+    #[cfg(feature = "dbus_api")]
+    let dbus_shutdown_chs = match dbus_options {
+        Some(opts) => {
+            let (_, chs) = api::start_dbus_thread(
+                opts,
+                api_event_clone.try_clone().map_err(Error::EventFdClone)?,
+                api_sender.clone(),
+                seccomp_action,
+                exit_event.try_clone().map_err(Error::EventFdClone)?,
+                hypervisor_type,
+            )?;
+            Some(chs)
+        }
+        None => None,
+    };
+
     if let Some(http_path) = http_path {
         api::start_http_path_thread(
             http_path,
-            http_api_event,
+            api_event_clone,
             api_sender,
             seccomp_action,
-            exit_evt,
+            exit_event,
             hypervisor_type,
         )?;
     } else if let Some(http_fd) = http_fd {
         api::start_http_fd_thread(
             http_fd,
-            http_api_event,
+            api_event_clone,
             api_sender,
             seccomp_action,
-            exit_evt,
+            exit_event,
             hypervisor_type,
         )?;
     }
@@ -379,7 +407,11 @@ pub fn start_vmm_thread(
             .map_err(Error::GdbThreadSpawn)?;
     }
 
-    Ok(thread)
+    Ok(VmmThreadHandle {
+        thread_handle: thread,
+        #[cfg(feature = "dbus_api")]
+        dbus_shutdown_chs,
+    })
 }
 
 #[derive(Clone, Deserialize, Serialize)]
@@ -388,6 +420,27 @@ struct VmMigrationConfig {
     #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
     common_cpuid: Vec<hypervisor::arch::x86::CpuIdEntry>,
     memory_manager_data: MemoryManagerSnapshotData,
+}
+
+#[derive(Debug, Clone)]
+pub struct VmmVersionInfo {
+    pub build_version: String,
+    pub version: String,
+}
+
+impl VmmVersionInfo {
+    pub fn new(build_version: &str, version: &str) -> Self {
+        Self {
+            build_version: build_version.to_owned(),
+            version: version.to_owned(),
+        }
+    }
+}
+
+pub struct VmmThreadHandle {
+    pub thread_handle: thread::JoinHandle<Result<()>>,
+    #[cfg(feature = "dbus_api")]
+    pub dbus_shutdown_chs: Option<DBusApiShutdownChannels>,
 }
 
 pub struct Vmm {
@@ -399,7 +452,7 @@ pub struct Vmm {
     debug_evt: EventFd,
     #[cfg(feature = "guest_debug")]
     vm_debug_evt: EventFd,
-    version: String,
+    version: VmmVersionInfo,
     vm: Option<Vm>,
     vm_config: Option<Arc<Mutex<VmConfig>>>,
     seccomp_action: SeccompAction,
@@ -407,12 +460,17 @@ pub struct Vmm {
     activate_evt: EventFd,
     signals: Option<Handle>,
     threads: Vec<thread::JoinHandle<()>>,
+    original_termios_opt: Arc<Mutex<Option<termios>>>,
 }
 
 impl Vmm {
     pub const HANDLED_SIGNALS: [i32; 2] = [SIGTERM, SIGINT];
 
-    fn signal_handler(mut signals: Signals, on_tty: bool, exit_evt: &EventFd) {
+    fn signal_handler(
+        mut signals: Signals,
+        original_termios_opt: Arc<Mutex<Option<termios>>>,
+        exit_evt: &EventFd,
+    ) {
         for sig in &Self::HANDLED_SIGNALS {
             unblock_signal(*sig).unwrap();
         }
@@ -422,12 +480,17 @@ impl Vmm {
                 SIGTERM | SIGINT => {
                     if exit_evt.write(1).is_err() {
                         // Resetting the terminal is usually done as the VMM exits
-                        if on_tty {
-                            io::stdin()
-                                .lock()
-                                .set_canon_mode()
-                                .expect("failed to restore terminal mode");
+                        if let Ok(lock) = original_termios_opt.lock() {
+                            if let Some(termios) = *lock {
+                                // SAFETY: FFI call
+                                let _ = unsafe {
+                                    tcsetattr(stdout().lock().as_raw_fd(), TCSANOW, &termios)
+                                };
+                            }
+                        } else {
+                            warn!("Failed to lock original termios");
                         }
+
                         std::process::exit(1);
                     }
                 }
@@ -442,8 +505,7 @@ impl Vmm {
             Ok(signals) => {
                 self.signals = Some(signals.handle());
                 let exit_evt = self.exit_evt.try_clone().map_err(Error::EventFdClone)?;
-                // SAFETY: trivially safe
-                let on_tty = unsafe { libc::isatty(libc::STDIN_FILENO) } != 0;
+                let original_termios_opt = Arc::clone(&self.original_termios_opt);
 
                 let signal_handler_seccomp_filter = get_seccomp_filter(
                     &self.seccomp_action,
@@ -465,10 +527,10 @@ impl Vmm {
                                 }
                             }
                             std::panic::catch_unwind(AssertUnwindSafe(|| {
-                                Vmm::signal_handler(signals, on_tty, &exit_evt);
+                                Vmm::signal_handler(signals, original_termios_opt, &exit_evt);
                             }))
                             .map_err(|_| {
-                                error!("signal_handler thead panicked");
+                                error!("vmm signal_handler thread panicked");
                                 exit_evt.write(1).ok()
                             })
                             .ok();
@@ -482,7 +544,7 @@ impl Vmm {
     }
 
     fn new(
-        vmm_version: String,
+        vmm_version: VmmVersionInfo,
         api_evt: EventFd,
         #[cfg(feature = "guest_debug")] debug_evt: EventFd,
         #[cfg(feature = "guest_debug")] vm_debug_evt: EventFd,
@@ -532,6 +594,7 @@ impl Vmm {
             activate_evt,
             signals: None,
             threads: vec![],
+            original_termios_opt: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -582,6 +645,7 @@ impl Vmm {
                         None,
                         None,
                         None,
+                        Arc::clone(&self.original_termios_opt),
                         None,
                         None,
                         None,
@@ -680,6 +744,7 @@ impl Vmm {
             None,
             None,
             None,
+            Arc::clone(&self.original_termios_opt),
             Some(snapshot),
             Some(source_url),
             Some(restore_cfg.prefault),
@@ -760,6 +825,7 @@ impl Vmm {
             serial_pty,
             console_pty,
             console_resize_pipe,
+            Arc::clone(&self.original_termios_opt),
             None,
             None,
             None,
@@ -802,8 +868,15 @@ impl Vmm {
     }
 
     fn vmm_ping(&self) -> VmmPingResponse {
+        let VmmVersionInfo {
+            build_version,
+            version,
+        } = self.version.clone();
+
         VmmPingResponse {
-            version: self.version.clone(),
+            build_version,
+            version,
+            pid: std::process::id() as i64,
         }
     }
 
@@ -1186,7 +1259,8 @@ impl Vmm {
             ))
         })?;
 
-        let phys_bits = vm::physical_bits(config.lock().unwrap().cpus.max_phys_bits);
+        let phys_bits =
+            vm::physical_bits(&self.hypervisor, config.lock().unwrap().cpus.max_phys_bits);
 
         let memory_manager = MemoryManager::new(
             vm,
@@ -1262,6 +1336,7 @@ impl Vmm {
             None,
             None,
             None,
+            Arc::clone(&self.original_termios_opt),
             Some(snapshot),
         )
         .map_err(|e| {
@@ -1501,7 +1576,8 @@ impl Vmm {
         let vm_config = vm.get_config();
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
         let common_cpuid = {
-            let phys_bits = vm::physical_bits(vm_config.lock().unwrap().cpus.max_phys_bits);
+            let phys_bits =
+                vm::physical_bits(&hypervisor, vm_config.lock().unwrap().cpus.max_phys_bits);
             arch::generate_common_cpuid(
                 &hypervisor,
                 None,
@@ -1691,7 +1767,7 @@ impl Vmm {
         let dest_cpuid = &{
             let vm_config = &src_vm_config.lock().unwrap();
 
-            let phys_bits = vm::physical_bits(vm_config.cpus.max_phys_bits);
+            let phys_bits = vm::physical_bits(&self.hypervisor, vm_config.cpus.max_phys_bits);
             arch::generate_common_cpuid(
                 &self.hypervisor.clone(),
                 None,
@@ -2057,7 +2133,7 @@ mod unit_tests {
 
     fn create_dummy_vmm() -> Vmm {
         Vmm::new(
-            "dummy".to_string(),
+            VmmVersionInfo::new("dummy", "dummy"),
             EventFd::new(EFD_NONBLOCK).unwrap(),
             #[cfg(feature = "guest_debug")]
             EventFd::new(EFD_NONBLOCK).unwrap(),
@@ -2130,6 +2206,7 @@ mod unit_tests {
             gdb: false,
             platform: None,
             tpm: None,
+            preserved_fds: None,
         }))
     }
 

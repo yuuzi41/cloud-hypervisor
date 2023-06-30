@@ -2,7 +2,6 @@
 // Use of this source code is governed by a BSD-style license that can be
 // found in the THIRD-PARTY file.
 
-#![allow(clippy::all)]
 #![allow(non_upper_case_globals)]
 #![allow(non_camel_case_types)]
 #![allow(non_snake_case)]
@@ -28,10 +27,12 @@ pub mod inn;
 // generated with bindgen /usr/include/linux/sockios.h --no-unstable-rust
 // --constified-enum '*' --with-derive-default
 pub mod sockios;
-pub use if_tun::*;
-pub use iff::*;
-pub use inn::*;
-pub use sockios::*;
+pub use if_tun::{
+    sock_fprog, IFF_MULTI_QUEUE, IFF_NO_PI, IFF_TAP, IFF_VNET_HDR, TUN_F_CSUM, TUN_F_TSO4,
+    TUN_F_TSO6, TUN_F_TSO_ECN, TUN_F_UFO,
+};
+pub use iff::{ifreq, net_device_flags_IFF_UP, setsockopt, sockaddr, AF_INET};
+pub use inn::sockaddr_in;
 
 pub const TUNTAP: ::std::os::raw::c_uint = 84;
 
